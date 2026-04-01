@@ -2,7 +2,7 @@
 
 1. Download Premiere Pro shortcuts:
 ```
-curl --output-dir ~/Documents/Adobe/Premiere\ Pro/ -O "https://raw.githubusercontent.com/lucuma13/NLE_Preferences/main/Homebrew_20260331/Luis_Mengo_[20-30].[1-9].kys"
+curl --output-dir ~/Documents/Adobe/Premiere\ Pro/ -O "https://github.com/lucuma13/prem/blob/main/Luis_Mengo_25.1.kys"
 ```
 
 2. Change default shell to bash:
