@@ -1,8 +1,8 @@
 ## Set up new worksation
 
-1. Download Premiere Pro shortcuts:
+1. Download my [Premiere Pro shortcuts](https://raw.githubusercontent.com/lucuma13/prem/refs/heads/main/Luis_Mengo_25.1.kys):
 ```
-curl --output-dir ~/Documents/Adobe/Premiere\ Pro/ -O "https://github.com/lucuma13/prem/blob/main/Luis_Mengo_25.1.kys"
+curl --output-dir ~/Documents/Adobe/Premiere\ Pro/ -O "https://raw.githubusercontent.com/lucuma13/prem/refs/heads/main/Luis_Mengo_25.1.kys:"
 ```
 
 2. Change default shell to bash:
