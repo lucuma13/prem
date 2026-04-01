@@ -1,6 +1,6 @@
 ## Set up new worksation
 
-1. Download my [Premiere Pro shortcuts](https://raw.githubusercontent.com/lucuma13/prem/refs/heads/main/Luis_Mengo_25.1.kys):
+1. Download my [Premiere Pro shortcuts](https://raw.githubusercontent.com/lucuma13/prem/refs/heads/main/Luis_Mengo_25.1.kys) (right-click on link and "Save link as"):
 ```
 curl --output-dir ~/Documents/Adobe/Premiere\ Pro/ -O "https://raw.githubusercontent.com/lucuma13/prem/refs/heads/main/Luis_Mengo_25.1.kys:"
 ```
