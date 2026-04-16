@@ -17,7 +17,7 @@ chsh -sh /bin/bash
 
 4. Install useful formulas and casks:
 ```
-brew tap lucuma13/homebrew-dit
+brew tap lucuma13/dit
 brew install git media-info exiftool ffmpeg atomicparsley bento4 imagemagick wget lookback
 brew install --cask google-chrome vlc caffeine audacity mediainfo mediahuman-audio-converter appcleaner
 ```
