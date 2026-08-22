@@ -3,7 +3,8 @@
 #   - file encoding (pure ASCII, no BOM) so legacy PowerShell doesn't garble it
 #   - liveness of the external resources the installer pulls (plugins, winget,
 #     PyPI)
-#   - Set-PremierePro / Get-WorkspaceName / Set-PrefNode prefs handling
+#   - Set-PremierePro / Get-WorkspaceName / Set-PrefNode / Set-ForcedPrefNode
+#     prefs handling
 #   - Test-AppInstalled across both registry views (a false negative reinstalls)
 #   - Find-UvExe returning a single path from the right candidate
 #   - Constrained Language Mode survival, statically (no blocked .NET is
@@ -28,17 +29,22 @@ $PremiereVersions = Get-ChildItem "$PSScriptRoot/fixtures" -Directory -Filter 'p
         @{ Version = ($_.Name -replace '^premiere_pro_v?', ''); Dir = $_.Name }
     }
 
-# Read the timeline nodes straight from the `foreach ($node in @(...))` loop in the
-# script (via the AST, so commented-out nodes are ignored).
-$TimelineNodes = & {
+# Read the force-written prefs straight from the `$forced = @(...)` table in the
+# script (via the AST, so a commented-out row is ignored). Adding a row there
+# automatically adds its checks below - no test edit needed.
+$ForcedPrefs = & {
     $ast = [System.Management.Automation.Language.Parser]::ParseFile(
         "$PSScriptRoot/../src/load-win.ps1", [ref]$null, [ref]$null)
-    $loop = $ast.FindAll({ param($n)
-            $n -is [System.Management.Automation.Language.ForEachStatementAst] -and
-            $n.Variable.VariablePath.UserPath -eq 'node' }, $true) | Select-Object -First 1
-    $loop.Condition.FindAll({ param($n)
+    $assign = $ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+            $n.Left.VariablePath.UserPath -eq 'forced' }, $true) | Select-Object -First 1
+    $assign.Right.FindAll({ param($n)
             $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) |
-        ForEach-Object { @{ Node = $_.Value } }
+        ForEach-Object {
+            $node, $value, $minMajor = $_.Value -split '\|'
+            @{ Node = $node; Value = $value; MinMajor = $minMajor }
+        }
 }
 
 # Resolved at discovery time so -Skip can see them. The WOW64 registry test
@@ -1344,17 +1350,17 @@ Describe "Set-PremierePro (Premiere <Version>)" -ForEach $PremiereVersions {
     }
 
     It "shortcut set is activated" {
-        Set-PremierePro $prefs "LGG_25.1_WINDOWS.kys" "LGG - Single monitor"
+        Set-PremierePro $prefs "LGG_25.1_WINDOWS.kys" "LGG - Single monitor" $Version
         Get-Content $prefs -Raw | Should -Match '<FE\.Prefs\.Shortcuts\.Filename>LGG_25\.1_WINDOWS\.kys</FE\.Prefs\.Shortcuts\.Filename>'
     }
 
     It "workspace is activated, spaces preserved" {
-        Set-PremierePro $prefs "LGG_25.1_WINDOWS.kys" "LGG - Single monitor"
+        Set-PremierePro $prefs "LGG_25.1_WINDOWS.kys" "LGG - Single monitor" $Version
         Get-Content $prefs -Raw | Should -Match '<FE\.Application\.LastWorkspaceName>LGG - Single monitor</FE\.Application\.LastWorkspaceName>'
     }
 
     It "labels switch to Classic (names + colours + marker)" {
-        Set-PremierePro $prefs "x.kys" "WS"
+        Set-PremierePro $prefs "x.kys" "WS" $Version
         $content = Get-Content $prefs -Raw
         $content | Should -Match '<BE\.Prefs\.LabelNames\.0>Violet</BE\.Prefs\.LabelNames\.0>'
         $content | Should -Match '<BE\.Prefs\.LabelNames\.15>Yellow</BE\.Prefs\.LabelNames\.15>'
@@ -1364,35 +1370,83 @@ Describe "Set-PremierePro (Premiere <Version>)" -ForEach $PremiereVersions {
         $content | Should -Not -Match 'Vibrant'
     }
 
-    It "auto-save enabled every 5 minutes" {
-        Set-PremierePro $prefs "x.kys" "WS"
+    It "auto-save enabled every 5 minutes, keeping 200 project versions" {
+        Set-PremierePro $prefs "x.kys" "WS" $Version
         $content = Get-Content $prefs -Raw
         $content | Should -Match '<BE\.Prefs\.AutoSave\.DoSave>true</BE\.Prefs\.AutoSave\.DoSave>'
         $content | Should -Match '<BE\.Prefs\.AutoSave\.Interval>5</BE\.Prefs\.AutoSave\.Interval>'
+        $content | Should -Match '<BE\.Prefs\.AutoSave\.MaxProjectVersions>200</BE\.Prefs\.AutoSave\.MaxProjectVersions>'
     }
 
-    # One test per active node in the script's $node loop (see $TimelineNodes above).
-    It "timeline node <Node> is enabled" -ForEach $TimelineNodes {
-        Set-PremierePro $prefs "x.kys" "WS"
+    It "Linked Selection is enabled" {
+        Set-PremierePro $prefs "x.kys" "WS" $Version
+        Get-Content $prefs -Raw | Should -Match '<TL\.PREFLinkedSelectionState>true</TL\.PREFLinkedSelectionState>'
+    }
+
+    # One test per row of the script's $forced table (see $ForcedPrefs above). A row
+    # with a min-major above this Premiere is a preference that does not exist yet:
+    # the file must be left alone for it, and nothing reported, since its absence is
+    # permanent rather than a fresh-install artefact.
+    It "forced pref <Node> is written" -ForEach $ForcedPrefs {
         $tag = [regex]::Escape($Node)
-        Get-Content $prefs -Raw | Should -Match "<$tag>true</$tag>"
+        $output = Set-PremierePro $prefs "x.kys" "WS" $Version 6>&1 | Out-String
+        $output | Should -Not -Match 'not found and skipped'
+        $content = Get-Content $prefs -Raw
+        if ($MinMajor -and [int](($Version -split '\.')[0]) -lt [int]$MinMajor) {
+            $content | Should -Not -Match $tag
+        }
+        else {
+            $content | Should -Match "<$tag>$([regex]::Escape($Value))</$tag>"
+        }
+    }
+
+    # Premiere has not persisted these on a fresh install, so they must be CREATED
+    # rather than skipped - otherwise the default we disagree with silently stands.
+    It "forced pref <Node> is created when absent on a whitelisted version" -ForEach $ForcedPrefs {
+        $tag = [regex]::Escape($Node)
+        $kept = [System.IO.File]::ReadAllText($prefs) -split "`n" | Where-Object { $_ -notmatch $tag }
+        [System.IO.File]::WriteAllText($prefs, ($kept -join "`n"))
+
+        $output = Set-PremierePro $prefs "x.kys" "WS" $Version 6>&1 | Out-String
+        $output | Should -Not -Match 'not found and skipped'
+        $content = Get-Content $prefs -Raw
+        if ($MinMajor -and [int](($Version -split '\.')[0]) -lt [int]$MinMajor) {
+            $content | Should -Not -Match $tag
+        }
+        else {
+            $content | Should -Match "<$tag>$([regex]::Escape($Value))</$tag>"
+        }
+        { [xml]$content } | Should -Not -Throw
+    }
+
+    # On a non-whitelisted version an absent node is reported and skipped, leaving
+    # the file untouched for it.
+    It "forced pref <Node> is skipped (not created) on a non-whitelisted version" -ForEach $ForcedPrefs {
+        $tag = [regex]::Escape($Node)
+        $kept = [System.IO.File]::ReadAllText($prefs) -split "`n" | Where-Object { $_ -notmatch $tag }
+        [System.IO.File]::WriteAllText($prefs, ($kept -join "`n"))
+
+        $output = Set-PremierePro $prefs "x.kys" "WS" "0.0" 6>&1 | Out-String
+        Get-Content $prefs -Raw | Should -Not -Match $tag
+        # A row with a min-major is skipped silently on an unknown version, not reported.
+        if (-not $MinMajor) { $output | Should -Match ([regex]::Escape($Node)) }
     }
 
     It "output prefs is valid XML" {
-        Set-PremierePro $prefs "x.kys" "WS"
+        Set-PremierePro $prefs "x.kys" "WS" $Version
         { [xml](Get-Content $prefs -Raw) } | Should -Not -Throw
     }
 
     It "no BOM is introduced" {
-        Set-PremierePro $prefs "x.kys" "WS"
+        Set-PremierePro $prefs "x.kys" "WS" $Version
         $bytes = [System.IO.File]::ReadAllBytes($prefs)
         $bytes[0] | Should -Be 0x3C  # '<' - would be 0xEF/0xFF if a BOM were prepended
     }
 
     It "idempotent: second run is byte-identical to first" {
-        Set-PremierePro $prefs "LGG_25.1_WINDOWS.kys" "LGG - Single monitor"
+        Set-PremierePro $prefs "LGG_25.1_WINDOWS.kys" "LGG - Single monitor" $Version
         $hash1 = (Get-FileHash $prefs -Algorithm SHA256).Hash
-        Set-PremierePro $prefs "LGG_25.1_WINDOWS.kys" "LGG - Single monitor"
+        Set-PremierePro $prefs "LGG_25.1_WINDOWS.kys" "LGG - Single monitor" $Version
         $hash2 = (Get-FileHash $prefs -Algorithm SHA256).Hash
         $hash2 | Should -Be $hash1
     }
@@ -1401,9 +1455,9 @@ Describe "Set-PremierePro (Premiere <Version>)" -ForEach $PremiereVersions {
         $content = Get-Content $prefs -Raw
         $content = $content -replace 'TL\.PREFLinkedSelectionState', 'TL.PREFLinkedSelectionStateRENAMED'
         Set-Content $prefs $content -Encoding UTF8 -NoNewline
-        $output = Set-PremierePro $prefs "LGG_25.1_WINDOWS.kys" "LGG - Single monitor" 6>&1 | Out-String
+        $output = Set-PremierePro $prefs "LGG_25.1_WINDOWS.kys" "LGG - Single monitor" $Version 6>&1 | Out-String
         $output | Should -Match 'TL\.PREFLinkedSelectionState'
-        $output | Should -Match 'fresh install'
+        $output | Should -Match 'Adobe renamed'
         { [xml](Get-Content $prefs -Raw) } | Should -Not -Throw
         Get-Content $prefs -Raw | Should -Match '<BE\.Prefs\.AutoSave\.Interval>5</BE\.Prefs\.AutoSave\.Interval>'
         Get-Content $prefs -Raw | Should -Match '<TL\.PREFLinkedSelectionStateRENAMED>false</TL\.PREFLinkedSelectionStateRENAMED>'
@@ -1532,6 +1586,52 @@ Describe "Set-PrefNode" {
     It "returns false and leaves the file byte-for-byte untouched when the node is absent" {
         $before = (Get-FileHash $prefs -Algorithm SHA256).Hash
         Set-PrefNode $prefs "missing" "new" | Should -BeFalse
+        (Get-FileHash $prefs -Algorithm SHA256).Hash | Should -Be $before
+    }
+}
+
+# Set-ForcedPrefNode is Set-PrefNode plus creation, for the nodes whose Premiere
+# default is wrong for us (a fresh install has never written them). Mirrors
+# force_pref_node in load-mac.sh.
+Describe "Set-ForcedPrefNode" {
+    BeforeEach {
+        $script:prefs = Join-Path $TestDrive "forced-prefs"
+        $script:enc = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText(
+            $prefs, "<PremiereData>`n<Properties Version=`"1`">`n<x>old</x>`n</Properties>`n</PremiereData>`n", $enc)
+    }
+
+    It "edits a present node in place, like Set-PrefNode" {
+        Set-ForcedPrefNode $prefs "x" "new" | Should -BeTrue
+        Get-Content $prefs -Raw | Should -Match '<x>new</x>'
+    }
+
+    It "creates an absent node inside the Properties block" {
+        Set-ForcedPrefNode $prefs "y" "yes" | Should -BeTrue
+        Get-Content $prefs -Raw | Should -Match '<y>yes</y>'
+        { [xml](Get-Content $prefs -Raw) } | Should -Not -Throw
+    }
+
+    It "is idempotent: the created node is edited in place next time" {
+        Set-ForcedPrefNode $prefs "y" "yes" | Should -BeTrue
+        $hash1 = (Get-FileHash $prefs -Algorithm SHA256).Hash
+        Set-ForcedPrefNode $prefs "y" "yes" | Should -BeTrue
+        (Get-FileHash $prefs -Algorithm SHA256).Hash | Should -Be $hash1
+    }
+
+    # The node it authors is the only line ending this script writes into the
+    # prefs, and Premiere writes that file LF on Windows too.
+    It "writes its new node with a bare LF and no BOM" {
+        Set-ForcedPrefNode $prefs "y" "yes" | Should -BeTrue
+        $out = [System.IO.File]::ReadAllText($prefs)
+        $out | Should -Match "`n`t`t`t<y>yes</y>"
+        ([System.IO.File]::ReadAllBytes($prefs))[0] | Should -Be 0x3C
+    }
+
+    It "returns false and changes nothing when there is no Properties block" {
+        [System.IO.File]::WriteAllText($prefs, "<root><x>old</x></root>", $enc)
+        $before = (Get-FileHash $prefs -Algorithm SHA256).Hash
+        Set-ForcedPrefNode $prefs "y" "yes" | Should -BeFalse
         (Get-FileHash $prefs -Algorithm SHA256).Hash | Should -Be $before
     }
 }

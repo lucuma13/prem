@@ -210,10 +210,12 @@ force_pref_node() {
 
 # customise_premiere_pro <prefs> <kys_file> <ws_name> <version> — point
 # Premiere's prefs at the keyboard set + workspace, apply the Classic label
-# preset, enable auto-save every 5 minutes, and turn on the timeline's Link
-# Selection + Display Settings. Every node is matched exactly; any not found is
-# left untouched and collected into a single warning, so the script never
-# crashes or corrupts the prefs on a version bump.
+# preset, enable auto-save every 5 minutes keeping 200 project versions, turn on
+# the timeline's Link Selection + Display Settings, turn off Media Analysis'
+# "Analyze all imported media", and stop playback returning to the beginning when
+# it restarts. Every node is matched exactly; any not found is left untouched and
+# collected into a single warning, so the script never crashes or corrupts the
+# prefs on a version bump.
 #
 # A missing-node warning can mean one of two things:
 #   a) Fresh Premiere install — Premiere only writes certain nodes to disk after
@@ -228,7 +230,7 @@ customise_premiere_pro() {
   # (Premiere has no single preset switch, so we write the exact values).
   local label_names=(Violet Iris Caribbean Lavender Cerulean Forest Rose Mango Purple Blue Teal Magenta Tan Green Brown Yellow)
   local label_colors=(14717094 13408882 10016297 14910691 14597935 5814353 10776567 3909357 9896087 16727100 8421376 15151847 9814478 2191389 1262987 6611682)
-  local missing=() i tl_node
+  local missing=() i
 
   # Keyboard set
   set_pref_node "$prefs" "FE.Prefs.Shortcuts.Filename" "$kys_file" || missing+=("FE.Prefs.Shortcuts.Filename")
@@ -245,7 +247,8 @@ customise_premiere_pro() {
   done
   set_pref_node "$prefs" "PPro.LabelColorPresets.RecentPreset" '{"builtIn":true,"name":"Classic"}' || missing+=("PPro.LabelColorPresets.RecentPreset")
 
-  # Auto-save: on, every 5 minutes
+  # Auto-save: on, every 5 minutes. "Maximum Project Versions" is force-written
+  # further down, with the other nodes whose Premiere default is wrong for us.
   set_pref_node "$prefs" "BE.Prefs.AutoSave.DoSave" "true" || missing+=("BE.Prefs.AutoSave.DoSave")
   set_pref_node "$prefs" "BE.Prefs.AutoSave.Interval" "5" || missing+=("BE.Prefs.AutoSave.Interval")
 
@@ -262,35 +265,67 @@ customise_premiere_pro() {
   # install is fine and simply left untouched.
   set_pref_node "$prefs" "TL.PREFLinkedSelectionState" "true" || missing+=("TL.PREFLinkedSelectionState")
 
-  # Show Through Edits (TL.PREFShowThroughEditsState) and Show Duplicate Frame
-  # Markers (MZ.SQShowDuplicateMarkers) do NOT default to the value we want, so
-  # a fresh install left untouched would keep them wrong. Force-write them —
-  # creating the node if Premiere hasn't persisted it yet — on the major
-  # versions whose behaviour we've verified: 24.x, 25.x and 26.x. When 27.x
-  # ships, test it before adding it to this whitelist. On any other version fall
-  # back to the in-place edit (skip + report if absent). $version is normally
+  # Preferences whose Premiere default is NOT the value we want. A fresh install
+  # has never written these nodes, so leaving them untouched keeps the wrong
+  # default: they are force-written (created when absent) rather than skipped.
+  # Fields are node|value|min-major, min-major blank when every version has the
+  # node; the trailing comment on each row is the control it is behind in
+  # Premiere's UI.
+  #
+  # Premiere only persists these once the control has been toggled by hand, so
+  # finding the node in a real profile is the proof we need: it pins the name AND
+  # shows Premiere round-trips a value we write there. Every row below was read
+  # off a live profile (25.6.6 on Windows, 26.3.2 on macOS).
+  #
+  # Force-writing only happens on the majors we have evidence for: 25.x and 26.x
+  # seen live, 24.x carried over from the captures in tests/fixtures. When 27.x
+  # ships, look at a real prefs file before adding it here. On any other version
+  # fall back to the in-place edit (skip + report if absent). $version is normally
   # "24.0"/"26.3" etc; pull the leading major number.
+  #
+  # Kept in step with the $forced table in load-win.ps1 by a test, not by a shared
+  # file: each installer is invoked as a single downloaded script, with no
+  # checkout on the target machine to read one from.
   local major=""
   [[ "$version" =~ ([0-9]+)\. ]] && major="${BASH_REMATCH[1]}"
-  for tl_node in \
-    TL.PREFShowThroughEditsState \
-    MZ.SQShowDuplicateMarkers; do
+  local forced=(
+    "TL.PREFShowThroughEditsState|true|"                              # Show Through Edits
+    "MZ.SQShowDuplicateMarkers|true|"                                 # Show Duplicate Frame Markers
+    "MZ.Prefs.PlaybackEndReturnToBeginning|false|"                    # At playback end, return to beginning
+    "BE.Prefs.AutoSave.MaxProjectVersions|200|"                       # Auto Save: Maximum Project Versions
+    "BE.Prefs.MediaIntelligence.AnalyzeImportedMediaForMISO|false|25" # Analyze all imported media
+  )
+  local entry node value min_major
+  for entry in "${forced[@]}"; do
+    node="${entry%%|*}"
+    value="${entry#*|}"
+    min_major="${value#*|}"
+    value="${value%%|*}"
+    # A preference that postdates this Premiere has no node to write, and its
+    # absence is permanent rather than a fresh-install artefact - so skip it
+    # silently instead of reporting it.
+    if [ -n "$min_major" ] && [ -n "$major" ] && [ "$major" -lt "$min_major" ]; then
+      continue
+    fi
     case "$major" in
-    24 | 25 | 26) force_pref_node "$prefs" "$tl_node" "true" || missing+=("$tl_node") ;;
-    *) set_pref_node "$prefs" "$tl_node" "true" || missing+=("$tl_node") ;;
+    24 | 25 | 26) force_pref_node "$prefs" "$node" "$value" || missing+=("$node") ;;
+    *) set_pref_node "$prefs" "$node" "$value" || missing+=("$node") ;;
     esac
   done
 
   # A missing node leaves the file untouched for that node (never corrupted).
-  # It's expected on a fresh install (nodes default to the preferred value and
-  # are only written by Premiere after a manual change); otherwise Adobe may
-  # have renamed the node and the script needs revising.
+  # The nodes that can still be reported here are ones Premiere writes on every
+  # real machine (shortcuts, workspace, labels, auto-save) or whose default
+  # already matches ours — harmless on a fresh profile, suspicious anywhere else.
   if [ "${#missing[@]}" -gt 0 ]; then
     echo "  ⚠️  Premiere prefs on version ${version}: ${#missing[@]} preference node(s) not found and skipped (file untouched for those nodes):"
     printf '        - %s\n' "${missing[@]}"
-    echo "      This is expected on a fresh install (nodes default to the correct value"
-    echo "      and are only written by Premiere after a manual change). Otherwise,"
-    echo "      Adobe may have renamed these nodes — check and update the script."
+    echo "      Missing nodes are ones Premiere had never written. Every preference we"
+    echo "      know Premiere leaves unwritten until it is changed by hand is created"
+    echo "      when absent, so a report here means either a genuinely fresh profile"
+    echo "      or, on a machine that has had Premiere used on it, that Adobe renamed"
+    echo "      the node — diff a real prefs file around that control and update this"
+    echo "      script."
   fi
 }
 

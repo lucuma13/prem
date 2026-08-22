@@ -81,59 +81,107 @@ copy_prefs() { cp "$DIR/fixtures/$1/Adobe Premiere Pro Prefs_truncated" "$PREFS"
   done
 }
 
-@test "auto-save enabled every 5 minutes" {
+@test "auto-save enabled every 5 minutes, keeping 200 project versions" {
   for v in "${PREMIERE_VERSIONS[@]}"; do
     copy_prefs "$v"
     customise_premiere_pro "$PREFS" "x.kys" "WS" "$v"
     run cat "$PREFS"
     assert_output --partial '<BE.Prefs.AutoSave.DoSave>true</BE.Prefs.AutoSave.DoSave>'
     assert_output --partial '<BE.Prefs.AutoSave.Interval>5</BE.Prefs.AutoSave.Interval>'
+    assert_output --partial '<BE.Prefs.AutoSave.MaxProjectVersions>200</BE.Prefs.AutoSave.MaxProjectVersions>'
   done
 }
 
-# Read the timeline nodes straight from the `for tl_node in ...` loop in the script
-# (comment lines skipped). Commenting a node in/out there automatically adds/removes
-# its check below - no test edit needed.
-timeline_nodes() {
+# Major version of a fixture dir ("premiere_pro_v25.6.6" -> 25).
+premiere_major() { [[ "$1" =~ v([0-9]+)\. ]] && printf '%s' "${BASH_REMATCH[1]}"; }
+
+# Read the force-written prefs straight from the `forced=(...)` table in the
+# script, one "node|value|min-major" row each (the trailing UI-label comment is
+# stripped). Adding a row there automatically adds its checks below - no test
+# edit needed.
+forced_prefs() {
   awk '
-    /for tl_node in/ { capture=1; next }
+    /^  local forced=\(/ { capture = 1; next }
+    capture && /^  \)/ { exit }
     capture {
-      done = ($0 ~ /; *do/)
-      sub(/;.*$/, "", $0); gsub(/\\/, "", $0); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
-      if ($0 != "" && $0 !~ /^#/) print $0
-      if (done) capture=0
+      sub(/#.*$/, "", $0)
+      gsub(/^[[:space:]]*"|"[[:space:]]*$/, "", $0)
+      if ($0 != "") print $0
     }
   ' "$DIR/../src/load-mac.sh"
 }
 
-@test "timeline nodes from the script loop are enabled" {
-  local nodes
-  nodes="$(timeline_nodes)"
-  [ -n "$nodes" ] # guard: parsing must find at least one node
-  for v in "${PREMIERE_VERSIONS[@]}"; do
-    copy_prefs "$v"
-    customise_premiere_pro "$PREFS" "x.kys" "WS" "$v"
-    run cat "$PREFS"
-    assert_output --partial '<TL.PREFLinkedSelectionState>true</TL.PREFLinkedSelectionState>'
-    while IFS= read -r node; do
-      assert_output --partial "<$node>true</$node>"
-    done <<<"$nodes"
-  done
+# The same table and the same force-write whitelist live in load-win.ps1: each
+# installer is invoked as a single downloaded script, so neither can read a shared
+# file on the target machine. Guard the two copies against drift here.
+forced_prefs_win() {
+  awk '/\$forced = @\(/,/^    \)/' "$DIR/../src/load-win.ps1" | grep -oE "'[^']+'" | tr -d "'"
 }
 
-# The force-written nodes are absent on a fresh install - they must be created but only on
-# the whitelisted versions.
-@test "force nodes are created when absent on a whitelisted version" {
+@test "the forced pref table matches the one in load-win.ps1" {
+  local win
+  win="$(forced_prefs_win)"
+  [ -n "$win" ] # non-empty, so a silently non-matching parse can't pass vacuously
+  assert_equal "$(forced_prefs)" "$win"
+}
+
+@test "the force-write version whitelist matches the one in load-win.ps1" {
+  local mac win
+  mac="$(grep -oE '^ *[0-9]+( \| [0-9]+)*\) force_pref_node' "$DIR/../src/load-mac.sh" | grep -oE '[0-9]+' | sort -n | tr '\n' ' ')"
+  win="$(grep -oE '\$major -in [0-9, ]+' "$DIR/../src/load-win.ps1" | grep -oE '[0-9]+' | sort -n | tr '\n' ' ')"
+  [ -n "$mac" ]
+  assert_equal "$mac" "$win"
+}
+
+# Strip every forced node from $PREFS, simulating a fresh install where Premiere
+# has not written any of them yet.
+strip_forced() {
+  local node rest
+  while IFS='|' read -r node rest; do
+    sed -i.bak -E "/<${node//./\\.}>/d" "$PREFS"
+  done <<<"$1"
+}
+
+@test "every forced pref in the script table is written, respecting its version floor" {
+  local rows node value min
+  rows="$(forced_prefs)"
+  [ -n "$rows" ] # guard: parsing must find at least one row
   for v in "${PREMIERE_VERSIONS[@]}"; do
     copy_prefs "$v"
-    # Simulate a fresh install where Premiere has not written these nodes yet.
-    sed -i.bak -E '/<(TL\.PREFShowThroughEditsState|MZ\.SQShowDuplicateMarkers)>/d' "$PREFS"
     run customise_premiere_pro "$PREFS" "x.kys" "WS" "$v"
     assert_success
     refute_output --partial 'not found and skipped'
     run cat "$PREFS"
-    assert_output --partial '<TL.PREFShowThroughEditsState>true</TL.PREFShowThroughEditsState>'
-    assert_output --partial '<MZ.SQShowDuplicateMarkers>true</MZ.SQShowDuplicateMarkers>'
+    assert_output --partial '<TL.PREFLinkedSelectionState>true</TL.PREFLinkedSelectionState>'
+    while IFS='|' read -r node value min; do
+      if [ -n "$min" ] && [ "$(premiere_major "$v")" -lt "$min" ]; then
+        refute_output --partial "$node" # predates the preference: never written
+      else
+        assert_output --partial "<$node>$value</$node>"
+      fi
+    done <<<"$rows"
+  done
+}
+
+# The forced nodes are absent on a fresh install - they must be created, but only
+# on the whitelisted versions.
+@test "forced prefs are created when absent on a whitelisted version" {
+  local rows node value min
+  rows="$(forced_prefs)"
+  for v in "${PREMIERE_VERSIONS[@]}"; do
+    copy_prefs "$v"
+    strip_forced "$rows"
+    run customise_premiere_pro "$PREFS" "x.kys" "WS" "$v"
+    assert_success
+    refute_output --partial 'not found and skipped'
+    run cat "$PREFS"
+    while IFS='|' read -r node value min; do
+      if [ -n "$min" ] && [ "$(premiere_major "$v")" -lt "$min" ]; then
+        refute_output --partial "$node"
+      else
+        assert_output --partial "<$node>$value</$node>"
+      fi
+    done <<<"$rows"
     run xmllint --noout "$PREFS"
     assert_success
   done
@@ -141,17 +189,19 @@ timeline_nodes() {
 
 # On a non-whitelisted version an absent node is reported and skipped, leaving
 # the file untouched for it.
-@test "force nodes are skipped (not created) on a non-whitelisted version" {
+@test "forced prefs are skipped (not created) on a non-whitelisted version" {
+  local rows node rest
+  rows="$(forced_prefs)"
   copy_prefs "${PREMIERE_VERSIONS[0]}"
-  sed -i.bak -E '/<(TL\.PREFShowThroughEditsState|MZ\.SQShowDuplicateMarkers)>/d' "$PREFS"
+  strip_forced "$rows"
   run customise_premiere_pro "$PREFS" "x.kys" "WS" "0.0"
   assert_success
   assert_output --partial 'not found and skipped'
   assert_output --partial 'TL.PREFShowThroughEditsState'
-  assert_output --partial 'MZ.SQShowDuplicateMarkers'
   run cat "$PREFS"
-  refute_output --partial 'ShowThroughEditsState'
-  refute_output --partial 'SQShowDuplicateMarkers'
+  while IFS='|' read -r node rest; do
+    refute_output --partial "<$node>"
+  done <<<"$rows"
 }
 
 @test "output prefs is valid XML" {
@@ -191,7 +241,7 @@ timeline_nodes() {
     run customise_premiere_pro "$PREFS" "LGG_25.1.kys" "LGG - Single monitor" "$v"
     assert_success
     assert_output --partial 'not found and skipped'
-    assert_output --partial 'Adobe may have renamed these nodes'
+    assert_output --partial 'Adobe renamed'
     assert_output --partial 'TL.PREFLinkedSelectionState'
     run xmllint --noout "$PREFS"
     assert_success

@@ -217,6 +217,35 @@ function Set-PrefNode {
     return $true
 }
 
+# Set-ForcedPrefNode <prefs> <node> <value> - like Set-PrefNode, but when the
+# node is absent it CREATES it inside the <Properties> block instead of
+# skipping. Use only for nodes whose Premiere default is wrong for us, so a
+# fresh install (where Premiere has not written the node yet) is still
+# overridden. Returns $false without touching the file only when the
+# <Properties> block cannot be found.
+#
+# Idempotent: once created, later runs find the node and edit it in place.
+#
+# The inserted "`n" is the one line ending this script authors in the prefs, and
+# a bare LF is correct: Premiere writes this file LF on BOTH Windows and macOS
+# (unlike UserWorkspace*.xml, which is CRLF here). Mirrors force_pref_node in
+# load-mac.sh.
+#
+# Byte-level read/write for the same reason as Set-PrefNode: it guarantees no
+# BOM is introduced.
+function Set-ForcedPrefNode {
+    param($prefs, $node, $value)
+    if (Set-PrefNode -Prefs $prefs -Node $node -Value $value) { return $true }
+    $enc = [System.Text.Encoding]::UTF8
+    $content = $enc.GetString([System.IO.File]::ReadAllBytes($prefs))
+    $open = [regex]::Match($content, '<Properties\b[^>]*>')
+    if (-not $open.Success) { return $false }
+    $at = $open.Index + $open.Length
+    $new = $content.Substring(0, $at) + "`n`t`t`t<$node>$value</$node>" + $content.Substring($at)
+    [System.IO.File]::WriteAllBytes($prefs, $enc.GetBytes($new))
+    return $true
+}
+
 # Set-AudacityPref <cfg> <section> <key> <value> - set a key in Audacity's
 # audacity.cfg.
 #
@@ -267,10 +296,12 @@ function Set-AudacityPref {
     catch { return $false }
 }
 
-# Set-PremierePro <prefs> <kys_file> <ws_name> - point Premiere Pro's keyboard
-# shortcuts preset and active workspace at our files, use  Classic label colour
-# preset, enable auto-save every 5 minutes, and toggle on the Timeline's Linked
-# Selection button and some Timeline Display Settings.
+# Set-PremierePro <prefs> <kys_file> <ws_name> <version> - point Premiere Pro's
+# keyboard shortcuts preset and active workspace at our files, use  Classic label
+# colour preset, enable auto-save every 5 minutes keeping 200 project versions,
+# toggle on the Timeline's Linked Selection button and some Timeline Display
+# Settings, turn off Media Analysis' "Analyze all imported media", and stop
+# playback returning to the beginning when it restarts.
 #
 # A missing-node warning can mean one of two things:
 #   (a) Fresh Premiere install - Premiere only writes certain nodes to disk after
@@ -304,28 +335,69 @@ function Set-PremierePro {
     if (-not (Set-PrefNode -Prefs $prefs -Node "BE.Prefs.AutoSave.DoSave"   -Value "true")) { $missing += "BE.Prefs.AutoSave.DoSave" }
     if (-not (Set-PrefNode -Prefs $prefs -Node "BE.Prefs.AutoSave.Interval" -Value "5")) { $missing += "BE.Prefs.AutoSave.Interval" }
 
-    # Timeline toggles: Linked Selection + Timeline Display Settings (wrench menu)
-    foreach ($node in @(
-            'TL.PREFLinkedSelectionState',
-            'TL.PREFShowThroughEditsState',
-            'MZ.SQShowDuplicateMarkers'
-            # The preferences below are commented out for now because they are not written to the preference file until the default behaviour has changed:
-            # 'be.Prefs.Timeline.Show.Video.Thumbnails',
-            # 'be.Prefs.Timeline.Show.Video.Names',
-            # 'be.Prefs.Timeline.Show.Audio.Waveforms',
-            # 'be.Prefs.Timeline.Show.Audio.Names',
-            # 'be.Prefs.Timeline.Show.Proxy.Badges',
-            # 'TL.PREFShowFXBadges',
-        )) {
-        if (-not (Set-PrefNode -Prefs $prefs -Node $node -Value "true")) { $missing += $node }
+    # Timeline toggles: Linked Selection + Timeline Display Settings (wrench menu).
+    # Linked Selection already defaults to the value we want, so a missing node on a
+    # fresh install is fine and simply left untouched.
+    #
+    # The preferences below are commented out for now because they are not written to the preference file until the default behaviour has changed:
+    # 'be.Prefs.Timeline.Show.Video.Thumbnails',
+    # 'be.Prefs.Timeline.Show.Video.Names',
+    # 'be.Prefs.Timeline.Show.Audio.Waveforms',
+    # 'be.Prefs.Timeline.Show.Audio.Names',
+    # 'be.Prefs.Timeline.Show.Proxy.Badges',
+    # 'TL.PREFShowFXBadges',
+    if (-not (Set-PrefNode -Prefs $prefs -Node "TL.PREFLinkedSelectionState" -Value "true")) { $missing += "TL.PREFLinkedSelectionState" }
+
+    # Preferences whose Premiere default is NOT the value we want. A fresh install
+    # has never written these nodes, so leaving them untouched keeps the wrong
+    # default: they are force-written (created when absent) rather than skipped.
+    # Fields are node|value|min-major, min-major blank when every version has the
+    # node; the trailing comment on each row is the control it is behind in
+    # Premiere's UI.
+    #
+    # Premiere only persists these once the control has been toggled by hand, so
+    # finding the node in a real profile is the proof we need: it pins the name AND
+    # shows Premiere round-trips a value we write there. Every row below was read
+    # off a live profile (25.6.6 on Windows, 26.3.2 on macOS).
+    #
+    # Force-writing only happens on the majors we have evidence for: 25.x and 26.x
+    # seen live, 24.x carried over from the captures in tests/fixtures. When 27.x
+    # ships, look at a real prefs file before adding it here; on any other version
+    # fall back to the in-place edit (skip + report if absent). $version is normally
+    # "24.0"/"26.3" etc; pull the leading major number, or -1 when the caller passed
+    # no version.
+    #
+    # Mirrors customise_premiere_pro in load-mac.sh, kept in step by a test rather
+    # than a shared file: each installer is invoked as a single downloaded script,
+    # with no checkout on the target machine to read one from.
+    $major = if ("$version" -match '(\d+)\.') { [int]$Matches[1] } else { -1 }
+    $forced = @(
+        'TL.PREFShowThroughEditsState|true|'                              # Show Through Edits
+        'MZ.SQShowDuplicateMarkers|true|'                                 # Show Duplicate Frame Markers
+        'MZ.Prefs.PlaybackEndReturnToBeginning|false|'                    # At playback end, return to beginning
+        'BE.Prefs.AutoSave.MaxProjectVersions|200|'                       # Auto Save: Maximum Project Versions
+        'BE.Prefs.MediaIntelligence.AnalyzeImportedMediaForMISO|false|25' # Analyze all imported media
+    )
+    foreach ($row in $forced) {
+        $node, $value, $minMajor = $row -split '\|'
+        # A preference that postdates this Premiere has no node to write, and its
+        # absence is permanent rather than a fresh-install artefact - so skip it
+        # silently instead of reporting it.
+        if ($minMajor -and $major -ge 0 -and $major -lt [int]$minMajor) { continue }
+        $ok = if ($major -in 24, 25, 26) { Set-ForcedPrefNode -Prefs $prefs -Node $node -Value $value }
+        else { Set-PrefNode -Prefs $prefs -Node $node -Value $value }
+        if (-not $ok) { $missing += $node }
     }
 
     if ($missing.Count -gt 0) {
         Write-Host "  [warn] Premiere prefs on version ${version}: $($missing.Count) node(s) not found and skipped (file untouched for those nodes):"
         $missing | ForEach-Object { Write-Host "        - $_" }
-        Write-Host "      This is expected on a fresh install (nodes default to the correct value"
-        Write-Host "      and are only written by Premiere after a manual change). Otherwise,"
-        Write-Host "      Adobe may have renamed these nodes - check and update the script."
+        Write-Host "      Missing nodes are ones Premiere had never written. Every preference we"
+        Write-Host "      know Premiere leaves unwritten until it is changed by hand is created"
+        Write-Host "      when absent, so a report here means either a genuinely fresh profile"
+        Write-Host "      or, on a machine that has had Premiere used on it, that Adobe renamed"
+        Write-Host "      the node - diff a real prefs file around that control and update this"
+        Write-Host "      script."
     }
 }
 

@@ -6,6 +6,7 @@
 			<FE.Application.LastWorkspaceName>Editing</FE.Application.LastWorkspaceName>
 			<BE.Prefs.AutoSave.DoSave>false</BE.Prefs.AutoSave.DoSave>
 			<BE.Prefs.AutoSave.Interval>177</BE.Prefs.AutoSave.Interval>
+			<BE.Prefs.AutoSave.MaxProjectVersions>217</BE.Prefs.AutoSave.MaxProjectVersions>
 			<TL.PREFLinkedSelectionState>false</TL.PREFLinkedSelectionState>
 			<be.Prefs.Timeline.Show.Video.Thumbnails>false</be.Prefs.Timeline.Show.Video.Thumbnails>
 			<be.Prefs.Timeline.Show.Video.Names>false</be.Prefs.Timeline.Show.Video.Names>
