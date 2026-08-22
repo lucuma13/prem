@@ -402,8 +402,10 @@ function Set-FileAssociation {
 # AllFolders\Shell is the template tree. Its SUBKEYS are named by folder type,
 # not by view: a bag's view for a given type lives at <bag>\Shell\{type-guid},
 # and the matching AllFolders\Shell\{type-guid} is the default every folder of
-# that type inherits - for ordinary, content-guessed folder types. Known
-# folders like Downloads do not reliably consult it.
+# that type inherits - for ordinary, content-guessed folder types. Known folders
+# like Downloads do not reliably consult it. Every New-Item below is guarded by
+# a Test-Path, and that guard is load-bearing: New-Item -Force on a key that
+# already exists deletes the values in it.
 $ExplorerAllFoldersKey = "HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\Bags\AllFolders\Shell"
 $ExplorerFolderTypeKey = "HKCU:\Software\Microsoft\Windows\Shell\Bags\AllFolders\Shell"
 
@@ -609,6 +611,11 @@ function Set-ExplorerDefaultView {
     # would have been deleted along with it.
     foreach ($type in $ExplorerViewTemplates.Keys) {
         $k = Join-Path $ExplorerAllFoldersKey $type
+        # Unguarded New-Item, unlike everywhere else in this file: -Force wipes
+        # an existing key's values, which is harmless here only because the bag
+        # wipe above has just removed this key anyway, and because every value
+        # the template needs is rewritten immediately below. Add a value that is
+        # read but not written here and that stops being true.
         New-Item -Path $k -Force | Out-Null
         Set-ItemProperty -LiteralPath $k -Name "Sort" -Value $ExplorerViewTemplates[$type] -Type Binary
 
@@ -647,6 +654,79 @@ function Restart-Explorer {
     if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
         Start-Process explorer.exe
     }
+}
+
+# -----------------------------------------------------------------------------
+# Taskbar and system tray
+# -----------------------------------------------------------------------------
+# On MMTaskbarEnabled the value is absent until the setting is first changed.
+#
+# Writing 1 is therefore both necessary and sufficient. Registry cmdlets only,
+# so this survives Constrained Language Mode.
+$TaskbarAdvancedKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+$TaskbarAdvancedValues = [ordered] @{
+    TaskbarAl          = 1
+    MMTaskbarEnabled   = 1
+    ShowTaskViewButton = 0
+}
+$TaskbarSearchKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search"
+$TaskbarSearchValues = [ordered] @{
+    SearchboxTaskbarMode = 3
+}
+
+# "Other system tray icons" in Settings.
+$TrayIconKey = "HKCU:\Control Panel\NotifyIconSettings"
+$TRAY_ICON_HIDDEN = 0
+$TrayHideExecutable = "OneDrive.exe"
+
+# Test-Taskbar - true once every taskbar value matches.
+function Test-Taskbar {
+    param($advancedKey = $TaskbarAdvancedKey, $searchKey = $TaskbarSearchKey)
+    foreach ($name in $TaskbarAdvancedValues.Keys) {
+        if ((Get-RegValue $advancedKey $name) -ne $TaskbarAdvancedValues[$name]) { return $false }
+    }
+    foreach ($name in $TaskbarSearchValues.Keys) {
+        if ((Get-RegValue $searchKey $name) -ne $TaskbarSearchValues[$name]) { return $false }
+    }
+    return $true
+}
+
+# Get-TrayIconKeyPath - registry paths of the entries pointing at the named
+# executable.
+function Get-TrayIconKeyPath {
+    param($exeName = $TrayHideExecutable, $trayKey = $TrayIconKey)
+    if (-not (Test-Path -LiteralPath $trayKey)) { return }
+    foreach ($sub in (Get-ChildItem -LiteralPath $trayKey -ErrorAction SilentlyContinue)) {
+        $path = Join-Path $trayKey $sub.PSChildName
+        $exe = Get-RegValue $path "ExecutablePath"
+        if ($exe -and (Split-Path $exe -Leaf) -eq $exeName) { $path }
+    }
+}
+
+function Test-TrayIcon {
+    param($exeName = $TrayHideExecutable, $trayKey = $TrayIconKey)
+    foreach ($k in (Get-TrayIconKeyPath $exeName $trayKey)) {
+        if ((Get-RegValue $k "IsPromoted") -ne $TRAY_ICON_HIDDEN) { return $false }
+    }
+    return $true
+}
+
+# Set-Taskbar - apply the taskbar values and demote the tray icon.
+function Set-Taskbar {
+    if ((Test-Taskbar) -and (Test-TrayIcon)) { return $false }
+
+    foreach ($pair in @(@($TaskbarAdvancedKey, $TaskbarAdvancedValues), @($TaskbarSearchKey, $TaskbarSearchValues))) {
+        $key = $pair[0]
+        $values = $pair[1]
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+        foreach ($name in $values.Keys) {
+            Set-ItemProperty -LiteralPath $key -Name $name -Value $values[$name] -Type DWord
+        }
+    }
+    foreach ($k in (Get-TrayIconKeyPath)) {
+        Set-ItemProperty -LiteralPath $k -Name "IsPromoted" -Value $TRAY_ICON_HIDDEN -Type DWord
+    }
+    return $true
 }
 
 # winget package lists. Kept above the guard so the test suite can source them
@@ -899,6 +979,14 @@ function Test-WingetInstalled($id) {
     return $LASTEXITCODE -eq 0 -and ($result -match [regex]::Escape($id))
 }
 
+# Test-WingetUpgradePending <id> - true when winget still has a newer version
+# for an already-installed package.
+function Test-WingetUpgradePending($id) {
+    if (-not $WINGET_OK) { return $false }
+    $result = winget list --id $id --exact --upgrade-available --include-unknown --accept-source-agreements 2>$null
+    return $LASTEXITCODE -eq 0 -and ($result -match [regex]::Escape($id))
+}
+
 # Test-PkgReallyInstalled <id> - like Test-WingetInstalled, but for
 # $PORTABLE_FALLBACK_PKGS checks whether the REAL (Program Files) install is
 # present, not just any scope. winget list reports a package "installed" the
@@ -908,6 +996,15 @@ function Test-WingetInstalled($id) {
 function Test-PkgReallyInstalled($id) {
     if ($MACHINE_EXE_PATH.ContainsKey($id)) { return Test-Path $MACHINE_EXE_PATH[$id] }
     return Test-WingetInstalled $id
+}
+
+# Packages the elevated batch was given and that were still not current when it
+# came back.
+$PKG_NOT_APPLIED = @()
+
+# Test-PkgApplied <id> - installed, and not one the batch just failed to update.
+function Test-PkgApplied($id) {
+    return (Test-PkgReallyInstalled $id) -and ($PKG_NOT_APPLIED -notcontains $id)
 }
 
 # Invoke-WingetApply <id> [scope] - install the package, or upgrade it in place
@@ -1021,7 +1118,7 @@ function Show-Checklist {
     $kbOk = ($kbSpeed -eq "31") -and ($kbDelay -eq "0")
     $toggle = "HKCU:\Keyboard Layout\Toggle"
     $togglesOk = ((Get-RegValue $toggle 'Hotkey') -eq "3") -and ((Get-RegValue $toggle 'Language Hotkey') -eq "3") -and ((Get-RegValue $toggle 'Layout Hotkey') -eq "3")
-    $sysOk = $kbOk -and $togglesOk -and (Test-ExplorerViewFullyApplied)
+    $sysOk = $kbOk -and $togglesOk -and (Test-ExplorerViewFullyApplied) -and (Test-Taskbar) -and (Test-TrayIcon)
     $longPathsOk = (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled") -eq 1
     $premiereRunning = $PREMIERE_OK -and ($null -ne (Get-Process -Name "Adobe Premiere Pro*" -ErrorAction SilentlyContinue))
     $ahkActive = Test-Path $AhkScript
@@ -1059,7 +1156,7 @@ function Show-Checklist {
     else { WouldRun "Activate AHK macros" }
 
     # System preferences - keyboard repeat speed/delay, the disabled
-    # layout-switch hotkeys and Explorer's default folder view.
+    # layout-switch hotkeys, Explorer's default folder view and the taskbar.
     if ($sysOk) { Done "System preferences" } else { WouldRun "System preferences" }
 
     # Long path support - HKLM, needs elevation.
@@ -1082,8 +1179,8 @@ function Show-Checklist {
     # Install or update apps - winget packages, non-winget programs (Premiere Pro plugins) and uv tools
     # (each entry paired with its "already installed?" check). Installation is slow, so it runs last.
     $apps = @()
-    foreach ($pkg in $CORE_PKGS) { $apps += @{ name = (Get-PkgAlias $pkg); ok = (Test-PkgReallyInstalled $pkg) } }
-    if ($FULL) { foreach ($pkg in $FULL_PKGS) { $apps += @{ name = (Get-PkgAlias $pkg); ok = (Test-PkgReallyInstalled $pkg) } } }
+    foreach ($pkg in $CORE_PKGS) { $apps += @{ name = (Get-PkgAlias $pkg); ok = (Test-PkgApplied $pkg) } }
+    if ($FULL) { foreach ($pkg in $FULL_PKGS) { $apps += @{ name = (Get-PkgAlias $pkg); ok = (Test-PkgApplied $pkg) } } }
     if ($PREMIERE_OK) {
         # The plugins are the only Premiere step --mse drops; $PREMIERE_PKGS and
         # every config step stay.
@@ -1091,7 +1188,7 @@ function Show-Checklist {
             $apps += @{ name = "Mister Horse"; ok = (Test-MisterHorseInstalled) }
             $apps += @{ name = "Flicker Free"; ok = (Test-FlickerFreeInstalled) }
         }
-        foreach ($pkg in $PREMIERE_PKGS) { $apps += @{ name = (Get-PkgAlias $pkg); ok = (Test-WingetInstalled $pkg) } }
+        foreach ($pkg in $PREMIERE_PKGS) { $apps += @{ name = (Get-PkgAlias $pkg); ok = (Test-PkgApplied $pkg) } }
     }
     foreach ($pkg in $CORE_UV) { $apps += @{ name = $pkg; ok = (Test-UvInstalled $pkg) } }
 
@@ -1315,17 +1412,30 @@ public class Win32Shell {
     # Default apps - config that needs the app present (see Set-DefaultApp)
     Set-DefaultApp
 
+    # Taskbar and tray.
+    $taskbarChanged = Set-Taskbar
+    if ($taskbarChanged) {
+        Write-Host "  [note] Taskbar set: icons centred, on all displays, no Task view,"
+        Write-Host "         search icon and label, OneDrive out of the system tray."
+    }
+
     # Default folder view - no grouping anywhere, sort by Name ascending
     # everywhere except Downloads, which sorts by Date modified with the newest
     # file first. Last in the pass deliberately: applying it restarts the
-    # shell, so the relaunched Explorer picks up HideFileExt, the status bar and
-    # the new default apps in the same bounce. Guarded by its own state check,
-    # so a re-run neither clears the shellbags again nor closes the user's
-    # windows a second time.
-    if (Set-ExplorerDefaultView) {
+    # shell, so the relaunched Explorer picks up HideFileExt, the status bar,
+    # the taskbar and the new default apps in the same bounce. Guarded by its
+    # own state check, so a re-run neither clears the shellbags again nor closes
+    # the user's windows a second time.
+    $viewChanged = Set-ExplorerDefaultView
+    if ($viewChanged) {
         Write-Host "  [note] Explorer default view set to Name / ascending with no grouping,"
         Write-Host "         and Downloads to Date modified / newest first."
-        Write-Host "         Restarting Explorer to apply it - any open Explorer windows will close."
+    }
+    # One restart for whichever of the two actually changed - the taskbar needs
+    # it just as much as the folder view, and neither should bounce the shell a
+    # second time on a re-run.
+    if ($viewChanged -or $taskbarChanged) {
+        Write-Host "  [note] Restarting Explorer to apply it - any open Explorer windows will close."
         Restart-Explorer
     }
 
@@ -1377,7 +1487,7 @@ function Invoke-ElevatedInstall {
     $cmds = @()
     $wantMisterHorse = $false
     $wantFlickerFree = $false
-    $wantInstall = @()
+    $wantApply = @()
 
     # Long path support.
     if (-not $LONG_PATHS_OK) {
@@ -1438,16 +1548,25 @@ function Invoke-ElevatedInstall {
         $ids = @($CORE_PKGS | Where-Object { $_ -ne $UV_PKG -and $USER_SCOPE_PKGS -notcontains $_ })
         if ($FULL) { $ids += ($FULL_PKGS | Where-Object { $USER_SCOPE_PKGS -notcontains $_ }) }
         if ($PREMIERE_OK) { $ids += $PREMIERE_PKGS }
-        foreach ($id in $ids) {
-            if (Test-PkgReallyInstalled $id) {
-                $cmds += "winget upgrade --id $id --exact --silent --accept-package-agreements --accept-source-agreements"
-            }
-            else {
-                $cmds += "winget install --id $id --exact --silent --scope machine --accept-package-agreements --accept-source-agreements"
-                # Only fresh installs are worth re-checking afterwards: a failed
-                # upgrade leaves the package present, so the check can't tell it
-                # from a successful one (and the old version still works).
-                $wantInstall += $id
+        if ($ids.Count) {
+            # Warm the package source ONCE, before any package command, and only
+            # when there is a package command to run.
+            #
+            # winget is an MSIX app whose package source has to be registered
+            # per user, and the user here is not the one who ran the script: a
+            # standard user's elevation lands in whichever admin account
+            # answered the UAC prompt. One serialised attempt ahead of the batch
+            # is what that account needs
+            $cmds += "winget source update --accept-source-agreements --disable-interactivity"
+            foreach ($id in $ids) {
+                if (Test-PkgReallyInstalled $id) {
+                    $cmds += "winget upgrade --id $id --exact --silent --accept-package-agreements --accept-source-agreements"
+                }
+                else {
+                    $cmds += "winget install --id $id --exact --silent --scope machine --accept-package-agreements --accept-source-agreements"
+                }
+                # Every queued package is re-checked afterwards.
+                $wantApply += $id
             }
         }
     }
@@ -1490,15 +1609,25 @@ function Invoke-ElevatedInstall {
     # the previous one's exit code - which is what we want, one bad package
     # must not cost us the rest - but it also means a failure is swallowed, and
     # the cmd window closes over the error text before it can be read. So
-    # re-check the fresh installs against the same test that queued them and
-    # name the ones that didn't land. Skipped when the batch never ran: the
-    # decline is already reported, and listing every package on top of it is
-    # noise. Anything named here is re-queued automatically on the next --full
-    # run, so this is a heads-up, not an error.
-    if ($elevated -and $wantInstall.Count) {
-        $missing = @($wantInstall | Where-Object { -not (Test-PkgReallyInstalled $_) })
+    # re-check every package the batch was given and name the ones that didn't
+    # land.
+    #
+    # Both halves are needed, because "applied" means different things either
+    # side of the install/upgrade split: a fresh install that failed leaves
+    # nothing behind and fails Test-PkgReallyInstalled, while a failed upgrade
+    # leaves the OLD version sitting there, which passes it. Only
+    # Test-WingetUpgradePending can tell that second case from a success - and
+    # without it a batch that upgraded nothing at all still reported clean,
+    # which is exactly how a stale Audacity reached the checklist as [done].
+    if ($elevated -and $wantApply.Count) {
+        $missing = @($wantApply | Where-Object { -not (Test-PkgReallyInstalled $_) -or (Test-WingetUpgradePending $_) })
+        # Handed to Show-Checklist so the summary agrees with the warning below.
+        $script:PKG_NOT_APPLIED = $missing
         if ($missing.Count) {
-            Write-Host "  [warn] These did not install: $(($missing | ForEach-Object { Get-PkgAlias $_ }) -join ', '). The rest of the batch still ran - re-run with --full to retry them."
+            Write-Host "  [warn] These did not install or update: $(($missing | ForEach-Object { Get-PkgAlias $_ }) -join ', '). The rest of the batch still ran - re-run with --full to retry them."
+            if ($missing.Count -eq $wantApply.Count) {
+                Write-Host "  [warn] Nothing in the batch applied. If elevation used a different (admin) account, winget's package source may not be registered for it - sign in to that account once and re-run with --full."
+            }
         }
     }
 

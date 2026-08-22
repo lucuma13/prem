@@ -213,11 +213,74 @@ Describe "elevated installers run unattended" {
         $lp[0] | Should -Match 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem' -Because "LongPathsEnabled must be written to its documented key"
     }
 
+    # `winget source` installs nothing, so it carries no silent switch and is
+    # held to the prompt it can raise instead:.
+    It "refreshes the package source without prompting" {
+        $src = @($queued | Where-Object { $_ -match '"winget source\b' })
+        $src.Count | Should -Be 1 -Because "the source is warmed once, ahead of the package commands"
+        $src[0] | Should -CMatch '\s--accept-source-agreements\b' -Because "a first-time account is otherwise asked to accept them"
+        $src[0] | Should -CMatch '\s--disable-interactivity\b' -Because "nothing in an unattended batch may raise a prompt"
+    }
+
+    It "warms the package source before any package command" {
+        $wingetCmds = @($queued | Where-Object { $_ -match '"winget\b' })
+        $wingetCmds.Count | Should -BeGreaterThan 1
+        $wingetCmds[0] | Should -CMatch '"winget source\b' -Because (
+            "the source has to be registered before a package can resolve against it - " +
+            "letting the package commands race to register it is what left every one of them failing 8A15000F")
+    }
+
     # The catch-all: anything added to the batch later must carry a silent switch too.
     It "queues no installer that can stop for input" {
-        $loud = @($queued | Where-Object { $_ -notmatch '(?-i)\s(/S|/qn|/f|--silent)\b' })
+        $installers = @($queued | Where-Object { $_ -notmatch '"winget source\b' })
+        $loud = @($installers | Where-Object { $_ -notmatch '(?-i)\s(/S|/qn|/f|--silent)\b' })
         $loud | Should -BeNullOrEmpty -Because (
             "each of these can open a window an unattended run then waits on:`n$($loud -join "`n")")
+    }
+}
+
+# The batch discards every exit code ("&" between commands) and its output can't
+# be captured (Start-Process -Verb RunAs uses ShellExecute, which forbids
+# redirection), so the only thing standing between a batch that did nothing and
+# a checklist that says [done] is the re-check afterwards. Text-based for the
+# same reason as the suite above: Invoke-ElevatedInstall sits below the
+# $env:LOAD_LIB boundary and can't be called.
+#
+Describe "the elevated batch verifies what it queued" {
+    BeforeAll {
+        $loadWin = Get-Content "$PSScriptRoot/../src/load-win.ps1" -Raw
+        $script:body = [regex]::Match($loadWin, '(?s)function Invoke-ElevatedInstall \{.*?\n\}').Value
+        $script:full = $loadWin
+    }
+
+    It "tracks every queued package, upgrades included" {
+        $queuedIds = @($body -split "`r?`n" | Where-Object { $_ -match '\$wantApply \+= \$id' })
+        $queuedIds.Count | Should -Be 1 -Because "one collection point covers both arms of the install/upgrade branch"
+        $body | Should -Not -Match '\$wantInstall' -Because "the fresh-installs-only list is what let a failed upgrade through"
+    }
+
+    It "re-checks upgrades and not just presence" {
+        $body | Should -Match 'Test-WingetUpgradePending' -Because (
+            "Test-PkgReallyInstalled alone passes a failed upgrade - the old version is still there")
+        $body | Should -Match 'Test-PkgReallyInstalled' -Because "a failed fresh install leaves nothing behind to find"
+    }
+
+    It "asks winget the question that survives an unreadable version" {
+        $fn = [regex]::Match($full, '(?s)function Test-WingetUpgradePending\(\$id\) \{.*?\n\}').Value
+        $fn | Should -Not -BeNullOrEmpty
+        $fn | Should -Match '--upgrade-available' -Because "that is what narrows the listing to packages that are behind"
+        $fn | Should -Match '--include-unknown' -Because (
+            "a package whose installed version winget can't read is otherwise dropped and reads as current")
+        $fn | Should -Match '--exact' -Because (
+            "without it --id filters on a substring and MediaArea.MediaInfo matches MediaArea.MediaInfo.GUI")
+    }
+
+    It "feeds the result to the checklist" {
+        $body | Should -Match '\$script:PKG_NOT_APPLIED' -Because "the summary must not print [done] over the warning it just printed"
+        $full | Should -Match 'function Test-PkgApplied' -Because "the checklist reads the measurement through this"
+        $listed = @($full -split "`r?`n" | Where-Object { $_ -match 'ok\s*=\s*\(Test-PkgReallyInstalled' })
+        $listed | Should -BeNullOrEmpty -Because (
+            "the checklist's package lines go through Test-PkgApplied, which also excludes what the batch failed to update")
     }
 }
 
@@ -1702,5 +1765,120 @@ Describe "Set-AudacityPref" {
             ForEach-Object { $_.Matches[0].Groups[1].Value }
         $win | Should -Not -BeNullOrEmpty
         ($win -join ',') | Should -Be ($mac -join ',')
+    }
+}
+
+# Taskbar and system tray.
+#
+# Four DWORDs across two keys, plus the tray promotion. MMTaskbarEnabled is the
+# one with teeth: it is ABSENT on a machine where the setting was never touched
+# and reads as ON in that state, so "absent" must NOT count as applied -
+# otherwise this can never fix a machine somebody switched off.
+Describe "Test-Taskbar" {
+    It "is true once every value matches" {
+        Mock Get-RegValue {
+            switch ($name) {
+                "TaskbarAl" { 1 }
+                "MMTaskbarEnabled" { 1 }
+                "ShowTaskViewButton" { 0 }
+                "SearchboxTaskbarMode" { 3 }
+                default { $null }
+            }
+        }
+        Test-Taskbar | Should -BeTrue
+    }
+    It "is false while the icons are left-aligned" {
+        Mock Get-RegValue { if ($name -eq "TaskbarAl") { 0 } elseif ($name -eq "ShowTaskViewButton") { 0 } elseif ($name -eq "SearchboxTaskbarMode") { 3 } else { 1 } }
+        Test-Taskbar | Should -BeFalse
+    }
+    It "is false while the Task view button is shown" {
+        Mock Get-RegValue { if ($name -eq "ShowTaskViewButton") { 1 } elseif ($name -eq "SearchboxTaskbarMode") { 3 } else { 1 } }
+        Test-Taskbar | Should -BeFalse
+    }
+    It "is false while search is anything but icon and label" {
+        Mock Get-RegValue { if ($name -eq "SearchboxTaskbarMode") { 2 } elseif ($name -eq "ShowTaskViewButton") { 0 } else { 1 } }
+        Test-Taskbar | Should -BeFalse
+    }
+    # Absent reads as ON in the UI, but nothing can tell "on by default" from
+    # "off" without the value, so it must be written either way.
+    It "is false when MMTaskbarEnabled has never been written" {
+        Mock Get-RegValue {
+            switch ($name) {
+                "TaskbarAl" { 1 }
+                "MMTaskbarEnabled" { $null }
+                "ShowTaskViewButton" { 0 }
+                "SearchboxTaskbarMode" { 3 }
+                default { $null }
+            }
+        }
+        Test-Taskbar | Should -BeFalse
+    }
+}
+
+# The tray entry is keyed by a per-app id that differs on every machine, so
+# everything here turns on finding it by ExecutablePath instead. The probe key is
+# drive-free: Join-Path resolves HKCU:, and there is no such drive on a Mac.
+#
+# The Get-RegValue mocks are inline rather than shared: a mock body runs later,
+# in its own scope, so a parameter of some set-up helper is long gone by then.
+Describe "Test-TrayIcon" {
+    BeforeAll { $Probe = "probe-tray" }
+    BeforeEach {
+        Mock Test-Path { $true }
+        Mock Get-ChildItem {
+            @(
+                [pscustomobject] @{ PSChildName = "111" }
+                [pscustomobject] @{ PSChildName = "8003706424901561507" }
+                [pscustomobject] @{ PSChildName = "333" }
+            )
+        }
+    }
+
+    It "finds the OneDrive entry by executable, not by key name" {
+        Mock Get-RegValue {
+            if ($path -match "8003706424901561507") { "C:\Users\T\AppData\Local\Microsoft\OneDrive\OneDrive.exe" }
+            else { "C:\Windows\System32\other.exe" }
+        }
+        $found = @(Get-TrayIconKeyPath "OneDrive.exe" $Probe)
+        $found.Count | Should -Be 1
+        $found[0] | Should -Match "8003706424901561507"
+    }
+
+    It "is true when OneDrive is not promoted" {
+        Mock Get-RegValue {
+            if ($name -eq "ExecutablePath") {
+                if ($path -match "8003706424901561507") { "C:\Users\T\AppData\Local\Microsoft\OneDrive\OneDrive.exe" }
+                else { "C:\Windows\System32\other.exe" }
+            }
+            else { 0 }
+        }
+        Test-TrayIcon "OneDrive.exe" $Probe | Should -BeTrue
+    }
+
+    It "is false while OneDrive is promoted to the tray" {
+        Mock Get-RegValue {
+            if ($name -eq "ExecutablePath") {
+                if ($path -match "8003706424901561507") { "C:\Users\T\AppData\Local\Microsoft\OneDrive\OneDrive.exe" }
+                else { "C:\Windows\System32\other.exe" }
+            }
+            else { 1 }
+        }
+        Test-TrayIcon "OneDrive.exe" $Probe | Should -BeFalse
+    }
+
+    # An app that has never shown a tray icon has no entry, so there is nothing
+    # to hide - which is applied, not broken.
+    It "is true when there is no NotifyIconSettings key at all" {
+        Mock Test-Path { $false }
+        Test-TrayIcon "OneDrive.exe" $Probe | Should -BeTrue
+    }
+}
+
+# The state check gates the write, so a re-run does not bounce the shell again.
+Describe "Set-Taskbar" {
+    It "does nothing, and asks for no restart, once it is already applied" {
+        Mock Test-Taskbar { $true }
+        Mock Test-TrayIcon { $true }
+        Set-Taskbar | Should -BeFalse
     }
 }
