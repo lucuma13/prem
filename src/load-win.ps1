@@ -310,8 +310,10 @@ function Set-AudacityPref {
 #   (b) Adobe renamed the node in this Premiere version - the setting was NOT
 #       applied and the script needs updating.
 # Either way the file is left untouched for that node.
+#
+# --mse flag adds the $mseForced rows below.
 function Set-PremierePro {
-    param($prefs, $kysFile, $wsName, $version)
+    param($prefs, $kysFile, $wsName, $version, [switch]$mse)
     $labelNames = @('Violet', 'Iris', 'Caribbean', 'Lavender', 'Cerulean', 'Forest', 'Rose', 'Mango', 'Purple', 'Blue', 'Teal', 'Magenta', 'Tan', 'Green', 'Brown', 'Yellow')
     $labelColors = @('14717094', '13408882', '10016297', '14910691', '14597935', '5814353', '10776567', '3909357', '9896087', '16727100', '8421376', '15151847', '9814478', '2191389', '1262987', '6611682')
     $missing = @()
@@ -378,6 +380,12 @@ function Set-PremierePro {
         'BE.Prefs.AutoSave.MaxProjectVersions|200|'                       # Auto Save: Maximum Project Versions
         'BE.Prefs.MediaIntelligence.AnalyzeImportedMediaForMISO|false|25' # Analyze all imported media
     )
+    $mseForced = @(
+        'BE.Prefs.Audio.AutoPeakGeneration|false|'                       # Generate waveforms automatically during import
+        'BE.Prefs.General.AutoAudioCategorizationDuringImport|false|25'  # Auto-tag audio types in the timeline
+    )
+    if ($mse) { $forced += $mseForced }
+
     foreach ($row in $forced) {
         $node, $value, $minMajor = $row -split '\|'
         # A preference that postdates this Premiere has no node to write, and its
@@ -907,7 +915,8 @@ $DRY_RUN = $args -contains "--dry-run"
 
 # --mse - leave AutoHotkey and its macros out of the run entirely, and skip the
 # two Premiere plugins (Mister Horse, Flicker Free). Everything else Premiere
-# still applies: shortcuts, workspaces, preferences, LUTs and $PREMIERE_PKGS.
+# still applies: shortcuts, workspaces, preferences, LUTs and $PREMIERE_PKGS,
+# plus the two extra Audio preferences in $mseForced.
 $MSE = $args -contains "--mse"
 if ($MSE) {
     $FULL_PKGS = @($FULL_PKGS | Where-Object { $_ -ne $AHK_PKG })
@@ -1280,7 +1289,7 @@ function Invoke-FastPass {
                 # $profileDir.Parent.Name is the version folder (e.g. "25.0"),
                 # so each profile's warning is tagged with the Premiere version
                 # it came from.
-                Set-PremierePro -Prefs $prefs -KysFile $KYS_FILE -WsName $wsName -Version $profileDir.Parent.Name
+                Set-PremierePro -Prefs $prefs -KysFile $KYS_FILE -WsName $wsName -Version $profileDir.Parent.Name -Mse:$MSE
             }
         }
 

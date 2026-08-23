@@ -29,16 +29,15 @@ $PremiereVersions = Get-ChildItem "$PSScriptRoot/fixtures" -Directory -Filter 'p
         @{ Version = ($_.Name -replace '^premiere_pro_v?', ''); Dir = $_.Name }
     }
 
-# Read the force-written prefs straight from the `$forced = @(...)` table in the
-# script (via the AST, so a commented-out row is ignored). Adding a row there
+# Read a force-written pref table straight from the script. Adding a row to one
 # automatically adds its checks below - no test edit needed.
-$ForcedPrefs = & {
+function Get-ForcedTable($name) {
     $ast = [System.Management.Automation.Language.Parser]::ParseFile(
         "$PSScriptRoot/../src/load-win.ps1", [ref]$null, [ref]$null)
     $assign = $ast.FindAll({ param($n)
             $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
             $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
-            $n.Left.VariablePath.UserPath -eq 'forced' }, $true) | Select-Object -First 1
+            $n.Left.VariablePath.UserPath -eq $name }, $true) | Select-Object -First 1
     $assign.Right.FindAll({ param($n)
             $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) |
         ForEach-Object {
@@ -46,6 +45,9 @@ $ForcedPrefs = & {
             @{ Node = $node; Value = $value; MinMajor = $minMajor }
         }
 }
+# $forced is written on every run; $mseForced only under --mse.
+$ForcedPrefs = Get-ForcedTable 'forced'
+$MseForcedPrefs = Get-ForcedTable 'mseForced'
 
 # Resolved at discovery time so -Skip can see them. The WOW64 registry test
 # needs a 32-bit host to read from and elevation to plant a 64-bit-only entry to
@@ -1423,6 +1425,41 @@ Describe "Set-PremierePro (Premiere <Version>)" -ForEach $PremiereVersions {
         Get-Content $prefs -Raw | Should -Not -Match $tag
         # A row with a min-major is skipped silently on an unknown version, not reported.
         if (-not $MinMajor) { $output | Should -Match ([regex]::Escape($Node)) }
+    }
+
+    # One test per row of the script's $mseForced table. This is the
+    # create-when-absent case; the in-place edit is the test below it.
+    It "mse pref <Node> is created under -Mse" -ForEach $MseForcedPrefs {
+        $tag = [regex]::Escape($Node)
+        $output = Set-PremierePro $prefs "x.kys" "WS" $Version -Mse 6>&1 | Out-String
+        $output | Should -Not -Match 'not found and skipped'
+        $content = Get-Content $prefs -Raw
+        if ($MinMajor -and [int](($Version -split '\.')[0]) -lt [int]$MinMajor) {
+            $content | Should -Not -Match $tag
+        }
+        else {
+            $content | Should -Match "<$tag>$([regex]::Escape($Value))</$tag>"
+        }
+        { [xml]$content } | Should -Not -Throw
+    }
+
+    It "mse pref <Node> is overwritten under -Mse when Premiere already wrote it" -ForEach $MseForcedPrefs {
+        $tag = [regex]::Escape($Node)
+        Set-ForcedPrefNode -Prefs $prefs -Node $Node -Value 'true' | Out-Null
+
+        Set-PremierePro $prefs "x.kys" "WS" $Version -Mse | Out-Null
+        $expected = if ($MinMajor -and [int](($Version -split '\.')[0]) -lt [int]$MinMajor) { 'true' } else { $Value }
+        Get-Content $prefs -Raw | Should -Match "<$tag>$([regex]::Escape($expected))</$tag>"
+    }
+
+    # --mse is the only mode that writes these: a plain run leaves the node
+    # exactly as it found it.
+    It "mse pref <Node> is left alone without -Mse" -ForEach $MseForcedPrefs {
+        $tag = [regex]::Escape($Node)
+        $before = [regex]::Match([System.IO.File]::ReadAllText($prefs), "<$tag>[^<]*</$tag>").Value
+        $output = Set-PremierePro $prefs "x.kys" "WS" $Version 6>&1 | Out-String
+        $output | Should -Not -Match ([regex]::Escape($Node))
+        [regex]::Match((Get-Content $prefs -Raw), "<$tag>[^<]*</$tag>").Value | Should -Be $before
     }
 
     It "output prefs is valid XML" {
