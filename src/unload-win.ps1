@@ -211,16 +211,26 @@ function Get-MisterHorseStatePath {
 # bug.
 function Get-HistoryPath {
     $paths = @()
-    $opt = Get-PSReadLineOption -ErrorAction SilentlyContinue
-    if ($opt -and $opt.HistorySavePath) { $paths += $opt.HistorySavePath }
+    # Probed with Get-Command: -ErrorAction does not suppress a CommandNotFound,
+    # which is raised while the name is resolved, before a parameter is ever
+    # bound. On a host without PSReadLine the bare call still leaves $opt null
+    # and the sweep below still runs, so the outcome is the same - but it dumps
+    # a red error into the middle of the run that reads like the cleanup failed.
+    if (Get-Command Get-PSReadLineOption -ErrorAction SilentlyContinue) {
+        $opt = Get-PSReadLineOption -ErrorAction SilentlyContinue
+        if ($opt -and $opt.HistorySavePath) { $paths += $opt.HistorySavePath }
+    }
     # Only when APPDATA is actually set: interpolating an empty variable would yield
     # a relative "\Microsoft\Windows\..." that Test-UnderHome then refuses with a
     # warning - a confusing complaint about a path we invented ourselves.
     if ($env:APPDATA) {
-        $dir = "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine"
+        $appData = $env:APPDATA.TrimEnd('\')
+        $dir = "$appData\Microsoft\Windows\PowerShell\PSReadLine"
         $paths += "$dir\ConsoleHost_history.txt"
-        $paths += @(Get-ChildItem -LiteralPath $dir -Filter "*_history.txt" -File -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty FullName)
+        if (Test-Path -LiteralPath $dir -ErrorAction SilentlyContinue) {
+            $paths += @(Get-ChildItem -LiteralPath $dir -Filter "*_history.txt" -File -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty FullName)
+        }
     }
     return @($paths | Select-Object -Unique)
 }
@@ -250,6 +260,18 @@ function Stop-HistorySaving {
     if (-not (Get-Command Set-PSReadLineOption -ErrorAction SilentlyContinue)) { return $false }
     try {
         Set-PSReadLineOption -HistorySaveStyle SaveNothing -ErrorAction Stop
+        return $true
+    }
+    catch { return $false }
+}
+
+# Clear-HistoryBuffer - drop the commands the live console can still hand back on
+# arrow-up, and return whether that took effect.
+function Clear-HistoryBuffer {
+    param([bool]$InCallerSession = (Test-InCallerSession))
+    if (-not $InCallerSession) { return $false }
+    try {
+        [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory($null, $null)
         return $true
     }
     catch { return $false }
@@ -330,6 +352,9 @@ $CLAUDE_PKG = "Anthropic.ClaudeCode"
 # else - which is why unload removes it while leaving VLC, FFmpeg and the rest
 # of the installed apps in place.
 $AHK_PKG = "AutoHotkey.AutoHotkey"
+
+# Whether this run left the console's history genuinely dealt with.
+$script:HISTORY_STOPPED = $false
 
 function Note { param($msg); Write-Host ("  " + "[note]".PadRight(12) + $msg) }
 
@@ -619,20 +644,33 @@ function Clear-Claude {
 }
 
 function Clear-ShellHistory {
+    # The console you launched this from holds its own commands in memory -
+    # including the command that ran this script - in two separate places: the
+    # engine's Get-History table, which Clear-History empties, and PSReadLine's own
+    # list behind arrow-up, which only Clear-HistoryBuffer reaches.
+    #
+    # All of it before the files rather than after. PSReadLine appends to a fresh
+    # history file as you keep typing, so switching saving off first leaves no
+    # order in which a flush can land after the delete. Nothing can be typed into
+    # this console while the script is running, so that window was never really
+    # open - but this is also the order of the one-liner the summary hands the user
+    # to run by hand, and the two should not disagree.
+    if (-not $DRY_RUN) {
+        # Both evaluated before the -and, deliberately: it short-circuits, and the
+        # buffer still wants clearing even when saving could not be switched off.
+        $stopped = Stop-HistorySaving
+        Clear-History -ErrorAction SilentlyContinue
+        $cleared = Clear-HistoryBuffer
+        # Only "clean" when both took. Saving switched off while arrow-up still
+        # hands back the entrypoint is not what that sign-off promises.
+        $script:HISTORY_STOPPED = $stopped -and $cleared
+    }
+
     $did = $false
     foreach ($path in Get-HistoryPath) {
         if (Remove-TargetPath $path) { $did = $true }
     }
 
-    # The console you launched this from holds its own commands in memory and
-    # PSReadLine appends them to a fresh history file as you keep typing -
-    # including the command that ran this script. Clear-History empties this
-    # session's buffer, and Stop-HistorySaving keeps PSReadLine from writing the
-    # file back.
-    if (-not $DRY_RUN) {
-        Clear-History -ErrorAction SilentlyContinue
-        $script:HISTORY_STOPPED = Stop-HistorySaving
-    }
     Report -Did $did -DoneMsg "Cleared shell history" -WouldMsg "Would clear shell history" -SkipMsg "Shell history - Nothing to remove"
 }
 

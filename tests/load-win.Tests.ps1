@@ -762,16 +762,28 @@ Describe "Explorer default folder view" -Skip:(-not $IsWindowsHost) {
             $first.Extent.Text | Should -Match 'return'
         }
 
-        # The shell restart is the second half of the reset: explorer.exe writes its
-        # in-memory bags back as windows close, so a clear with the shell left running
-        # is undone by the time the user looks.
+        # The shell restart is the second half of the reset: explorer.exe writes
+        # its in-memory bags back as windows close, so a clear with the shell
+        # left running is undone by the time the user looks.
+        #
+        # Followed through the variable rather: the taskbar shares the one
+        # bounce, so what gates the restart is "the view changed OR the taskbar
+        # did".
         It "is followed by a shell restart at its call site" {
+            $assign = $ast.FindAll({ param($n)
+                    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $n.Right.Extent.Text -match 'Set-ExplorerDefaultView' }, $true) |
+                Select-Object -First 1
+            $assign | Should -Not -BeNullOrEmpty -Because 'the return value is what gates the restart'
+
+            $flag = $assign.Left.Extent.Text
             $call = $ast.FindAll({ param($n)
                     $n -is [System.Management.Automation.Language.IfStatementAst] -and
-                    $n.Clauses[0].Item1.Extent.Text -match 'Set-ExplorerDefaultView' }, $true) |
+                    $n.Clauses[0].Item1.Extent.Text -match [regex]::Escape($flag) -and
+                    $n.Clauses[0].Item2.Extent.Text -match 'Restart-Explorer' }, $true) |
                 Select-Object -First 1
-            $call | Should -Not -BeNullOrEmpty -Because 'the return value is what gates the restart'
-            $call.Clauses[0].Item2.Extent.Text | Should -Match 'Restart-Explorer'
+            $call | Should -Not -BeNullOrEmpty -Because (
+                "$flag has to gate a Restart-Explorer, or the cleared bags are written straight back")
         }
     }
 }

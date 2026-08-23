@@ -443,6 +443,20 @@ Describe "Shell history target paths" {
         $paths = @(Get-HistoryPath)
         @($paths | Select-Object -Unique).Count | Should -Be $paths.Count
     }
+
+    # A trailing backslash on APPDATA would build "...Roaming\\Microsoft\...".
+    # Windows resolves that, so the file is still removed - but it is no longer
+    # string-equal to the same file's FullName from the directory sweep, so
+    # Select-Object -Unique stops collapsing the two and --dry-run lists it twice.
+    It "normalises a trailing backslash on APPDATA" {
+        $original = $env:APPDATA
+        try {
+            $env:APPDATA = "C:\Users\test\AppData\Roaming\"
+            Get-HistoryPath |
+                Should -Contain "C:\Users\test\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+        }
+        finally { $env:APPDATA = $original }
+    }
 }
 
 # Deleting the history file is only half the job: PSReadLine's default save
@@ -498,6 +512,50 @@ Describe "Stopping history saving" {
         Set-PSReadLineOption -HistorySaveStyle SaveIncrementally
         & ([scriptblock]::Create("Stop-HistorySaving -InCallerSession `$true")) | Out-Null
         (Get-PSReadLineOption).HistorySaveStyle | Should -Be "SaveNothing"
+    }
+}
+
+# Removing the file leaves the console's own copy behind: PSReadLine read the
+# history into memory when the session started and serves arrow-up from that list,
+# which Clear-History never touches - it empties the engine's Get-History table, a
+# different store.
+Describe "Clearing the in-memory history buffer" {
+    It "reports failure from a child process rather than a false assurance" {
+        Clear-HistoryBuffer -InCallerSession $false | Should -BeFalse
+    }
+
+    It "wraps the PSReadLine call so an absent type cannot abort the run" {
+        $body = [regex]::Match(
+            (Get-Content "$PSScriptRoot/../src/unload-win.ps1" -Raw),
+            '(?s)function Clear-HistoryBuffer \{.*?\n\}').Value
+        $body | Should -BeLike "*PSConsoleReadLine*ClearHistory*"
+        $body | Should -BeLike "*try*catch*"
+    }
+}
+
+# Saving has to go off before the files go, not after: PSReadLine appends to a
+# fresh history file as the user keeps typing.
+Describe "Shell history cleanup order" {
+    BeforeAll {
+        $script:historyBody = [regex]::Match(
+            (Get-Content "$PSScriptRoot/../src/unload-win.ps1" -Raw),
+            '(?s)function Clear-ShellHistory \{.*?\n\}').Value
+    }
+
+    It "clears both of the console's own buffers, not just the files" {
+        $historyBody | Should -Not -BeNullOrEmpty -Because "Clear-ShellHistory should be findable"
+        $historyBody | Should -BeLike "*Clear-History *"
+        $historyBody | Should -BeLike "*Clear-HistoryBuffer*"
+    }
+
+    It "switches saving off before removing the files" {
+        $historyBody.IndexOf("Stop-HistorySaving") | Should -BeGreaterOrEqual 0
+        $historyBody.IndexOf("Stop-HistorySaving") |
+            Should -BeLessThan $historyBody.IndexOf("Remove-TargetPath")
+    }
+
+    It "claims a clean console only when both buffers were dealt with" {
+        $historyBody | Should -BeLike '*$stopped -and $cleared*'
     }
 }
 
