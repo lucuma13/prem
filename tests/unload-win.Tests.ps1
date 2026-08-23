@@ -358,6 +358,85 @@ Describe "Mister Horse sign-out" {
 
 # Quit Google Chrome the polite way, since a forced Chrome reopens with the
 # "didn't shut down correctly" bar and a half-written profile.
+# unload leaves both Premiere plugins installed on purpose (see Show-Usage), so
+# the only thing it owes the reader is an honest line about each. "Nothing to
+# remove" against an installed Product Manager said the opposite, and Flicker
+# Free went unmentioned altogether.
+Describe "the Premiere plugins are reported, not removed" {
+    BeforeAll {
+        $script:src = Get-Content "$PSScriptRoot/../src/unload-win.ps1" -Raw
+        $script:mhBody = [regex]::Match($src, '(?s)function Clear-MisterHorse \{.*?\n\}').Value
+        $script:ffBody = [regex]::Match($src, '(?s)function Show-FlickerFree \{.*?\n\}').Value
+    }
+
+    It "Mister Horse says 'already signed out' when the app is installed" {
+        $mhBody | Should -Not -BeNullOrEmpty -Because "Clear-MisterHorse should be findable"
+        $mhBody | Should -BeLike "*Test-MisterHorseInstalled*" -Because (
+            "the skip line has to know whether the app is there before claiming there is nothing to remove")
+        $mhBody | Should -BeLike "*already signed out*"
+    }
+
+    It "Flicker Free is reported by its own phase" {
+        $ffBody | Should -Not -BeNullOrEmpty -Because "Show-FlickerFree should be findable"
+        $ffBody | Should -BeLike "*Test-FlickerFreeInstalled*"
+        $ffBody | Should -BeLike "*still installed*"
+    }
+
+    It "runs Flicker Free as its own phase in the dispatch block" {
+        $dispatch = [regex]::Match($src, '(?s)^try \{.*?\n\}', 'Multiline').Value
+        $dispatch | Should -BeLike "*Show-FlickerFree*"
+    }
+
+    It "neither plugin is uninstalled" {
+        foreach ($body in $mhBody, $ffBody) {
+            $body | Should -Not -BeLike "*Uninstall-WingetPackage*"
+        }
+        $ffBody | Should -Not -BeLike "*Remove-TargetPath*"
+    }
+
+    # The DisplayNames are what these two register in the uninstall key, read off
+    # Z4-01. A pattern that stops matching them makes both lines above lie.
+    It "matches the DisplayNames the plugins actually register" {
+        $names = @{
+            'Test-MisterHorseInstalled' = 'Mister Horse Product Manager'
+            'Test-FlickerFreeInstalled' = 'Flicker Free'
+        }
+        foreach ($fn in $names.Keys) {
+            $pattern = [regex]::Match($src, "function $fn \{ Test-AppInstalled '([^']+)'").Groups[1].Value
+            $pattern | Should -Not -BeNullOrEmpty -Because "$fn should call Test-AppInstalled with a pattern"
+            $names[$fn] | Should -Match $pattern
+        }
+    }
+}
+
+# One line, whichever way AutoHotkey outlived the phase: the winget package still
+# installed (a cancelled admin prompt), or a copy on disk winget never installed.
+Describe "AutoHotkey still installed is one warning, never a second line" {
+    BeforeAll {
+        $script:ahkBody = [regex]::Match(
+            (Get-Content "$PSScriptRoot/../src/unload-win.ps1" -Raw),
+            '(?s)function Clear-Ahk \{.*?\n\}').Value
+    }
+
+    It "reports both cases through Report, not through a Note" {
+        $ahkBody | Should -Not -BeNullOrEmpty -Because "Clear-Ahk should be findable"
+        $ahkBody | Should -Not -BeLike "*Note *" -Because (
+            "a Note beside the warning says the same thing twice")
+        $ahkBody | Should -Match '-FailMsg'
+    }
+
+    It "covers the cancelled uninstall and the non-winget install" {
+        $ahkBody | Should -BeLike "*remove it from Settings > Apps by hand*"
+        $ahkBody | Should -BeLike "*not a winget install*"
+        $ahkBody | Should -BeLike "*Find-AhkExe*" -Because (
+            "the non-winget case is only visible on disk, and its path goes in the line")
+    }
+
+    It "stays quiet on a dry run, where nothing has been uninstalled yet" {
+        $ahkBody | Should -Match '\$DRY_RUN'
+    }
+}
+
 Describe "Google Chrome" {
     BeforeAll {
         $script:unloadWin = Get-Content "$PSScriptRoot/../src/unload-win.ps1" -Raw

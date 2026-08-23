@@ -311,6 +311,28 @@ function Remove-SelfTemp {
     }
 }
 
+# Test-AppInstalled <pattern> - does any Windows uninstall entry's DisplayName
+# match? Reads all three views because a 64-bit installer, a 32-bit one and a
+# per-user one each register somewhere different.
+function Test-AppInstalled($pattern) {
+    foreach ($key in @(
+            @{ Path = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"; View = "64" },
+            @{ Path = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"; View = "32" },
+            @{ Path = "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"; View = "64" }
+        )) {
+        foreach ($line in (reg.exe query $key.Path /s /v DisplayName "/reg:$($key.View)" 2>$null)) {
+            if ($line -match '\sDisplayName\s+REG_SZ\s+(.+)$') {
+                if ($Matches[1].Trim() -match $pattern) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
+# The two Premiere plugins load installs.
+function Test-FlickerFreeInstalled { Test-AppInstalled 'Flicker Free' }
+function Test-MisterHorseInstalled { Test-AppInstalled 'Mister Horse' }
+
 # Report -Did -DoneMsg -WouldMsg -SkipMsg [-Failed -FailMsg] - the one status
 # line each cleanup phase prints, chosen from whichever fits what actually
 # happened: something is knowingly still there, something was removed, something
@@ -495,19 +517,24 @@ function Clear-Ahk {
     if (Stop-AhkProcess) { $did = $true }
     $uninstall = Uninstall-WingetPackage $AHK_PKG "AutoHotkey"
     if ($uninstall -eq 'removed') { $did = $true }
-    Report -Did $did -Failed:($uninstall -eq 'failed') `
+
+    # Two ways AutoHotkey outlives this phase, and one line for both. A 'failed'
+    # uninstall is the winget package still there, which Settings can remove.
+    # Still on disk after an uninstall that did not fail is the .exe/.zip build
+    # from autohotkey.com, which this script doesn't touch and Settings won't
+    # list - so that one carries the path.
+    $exe = if ($DRY_RUN -or $uninstall -eq 'failed') { $null } else { Find-AhkExe }
+
+    $failMsg = if ($uninstall -eq 'failed') {
+        "AutoHotkey is still installed - remove it from Settings > Apps by hand"
+    }
+    else { "AutoHotkey is still installed at $exe - not a winget install; remove it by hand" }
+
+    Report -Did $did -Failed:(($uninstall -eq 'failed') -or [bool]$exe) `
         -DoneMsg "Uninstalled AutoHotkey" `
         -WouldMsg "Would uninstall AutoHotkey" `
         -SkipMsg "AutoHotkey - Nothing to remove" `
-        -FailMsg "AutoHotkey is still installed - remove it from Settings > Apps by hand"
-
-    # Still on disk after the uninstall means it was installed some other way (the
-    # .exe/.zip build from autohotkey.com rather than winget), which this script
-    # doesn't touch. Say so rather than let a "cleaned" summary imply otherwise.
-    if (-not $DRY_RUN) {
-        $exe = Find-AhkExe
-        if ($exe) { Note "AutoHotkey is still installed at $exe - not a winget install; remove it by hand" }
-    }
+        -FailMsg $failMsg
 }
 
 # Get-ChromeProcess - every running Google Chrome process (the browser and the
@@ -600,7 +627,12 @@ function Clear-MisterHorse {
     foreach ($path in Get-MisterHorseStatePath) {
         if (Remove-TargetPath $path) { $did = $true }
     }
-    Report -Did $did -DoneMsg "Signed out of Mister Horse Product Manager" -WouldMsg "Would sign out of Mister Horse Product Manager" -SkipMsg "Mister Horse Product Manager - Nothing to remove"
+    $skipMsg = if (Test-MisterHorseInstalled) {
+        "Mister Horse Product Manager - already signed out (the app stays installed)"
+    }
+    else { "Mister Horse Product Manager - Nothing to remove" }
+
+    Report -Did $did -DoneMsg "Signed out of Mister Horse Product Manager" -WouldMsg "Would sign out of Mister Horse Product Manager" -SkipMsg $skipMsg
 
     # A panel open inside a running Premiere or After Effects has the same
     # session in memory and writes its own copy back when the host quits, so a
@@ -679,6 +711,16 @@ function Clear-ShellHistory {
     Report -Did $did -DoneMsg "Cleared shell history" -WouldMsg "Would clear shell history" -SkipMsg "Shell history - Nothing to remove"
 }
 
+# Show-FlickerFree - report the plugin, remove nothing.
+function Show-FlickerFree {
+    $skipMsg = if (Test-FlickerFreeInstalled) {
+        "Flicker Free - still installed (plugins are left in place)"
+    }
+    else { "Flicker Free - Nothing to remove" }
+
+    Report -Did $false -DoneMsg "" -WouldMsg "" -SkipMsg $skipMsg
+}
+
 # -----------------------------------------------------------------------------
 # Dispatch
 # -----------------------------------------------------------------------------
@@ -699,6 +741,7 @@ try {
     Clear-WorkDir
     Clear-PremiereWorkspace
     Clear-MisterHorse
+    Show-FlickerFree
     Clear-Claude
     Clear-ShellHistory
 
