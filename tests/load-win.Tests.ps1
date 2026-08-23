@@ -348,7 +348,7 @@ Describe "Remove-SelfTemp temp-dir guard" {
 # Set-StrictMode -Version Latest the obvious `(Get-ItemProperty -EA SilentlyContinue).X`
 # still throws on a missing property, AND leaves the assignment target undefined, so
 # the next read throws again - two errors per lookup on precisely the fresh profile
-# this script targets (no Keyboard Layout\Toggle, no UserChoice for an unclaimed type).
+# this script targets (no Keyboard Layout\Toggle, no shellbag for an unopened folder).
 # These run the reads in a child shell so the strict-mode error surfaces as it would
 # in production rather than being absorbed by the test host.
 Describe "Get-RegValue" -Skip:(-not $IsWindowsHost) {
@@ -840,23 +840,17 @@ Describe "Find-AhkExe picks the plain 64-bit interpreter" -Skip:(-not $IsWindows
     }
 }
 
-# Show-Checklist derives each default app's friendly name from its WingetId via the
-# package lists and $PKG_ALIAS, so a rename/typo there shows a raw id (or nothing).
-# Membership is computed at discovery so each id gets its own named test.
-Describe "Default-app / package-list consistency" {
+# Show-Checklist derives each package's friendly name from its WingetId via
+# $PKG_ALIAS, so a rename/typo there shows a raw id (or nothing). Membership is
+# computed at discovery so each id gets its own named test.
+Describe "Package-list consistency" {
     BeforeDiscovery {
         $env:LOAD_LIB = "1"
         . "$PSScriptRoot\..\src\load-win.ps1"
         $env:LOAD_LIB = $null
         $allPkgs = @($CORE_PKGS + $FULL_PKGS + $PREMIERE_PKGS)
-        $script:defaultAppIds = @($DEFAULT_APPS | ForEach-Object {
-                @{ Id = $_.WingetId; InList = ($allPkgs -contains $_.WingetId) } })
         $script:aliasIds = @($allPkgs | ForEach-Object {
                 @{ Id = $_; HasAlias = $PKG_ALIAS.ContainsKey($_) } })
-    }
-
-    It "default app <Id> is listed in CORE_PKGS/FULL_PKGS" -ForEach $defaultAppIds {
-        $InList | Should -BeTrue -Because "$Id is a default-app target but missing from the install lists"
     }
 
     It "package <Id> has a friendly alias in PKG_ALIAS" -ForEach $aliasIds {
@@ -865,8 +859,7 @@ Describe "Default-app / package-list consistency" {
 }
 
 # The script is meant to survive Constrained Language Mode (WDAC/AppLocker): the
-# .NET- backed steps (Add-Type/P-Invoke, the file-association tamper-hash, the
-# Premiere prefs byte write) are gated on $CLM and degrade to "skipped" instead
+# .NET- backed steps (Add-Type/P-Invoke, the Premiere prefs byte write) are gated on $CLM and degrade to "skipped" instead
 # of crashing. These guard that contract so a future edit can't quietly
 # reintroduce an unguarded .NET call.
 #
@@ -983,8 +976,8 @@ $null = [System.Environment]::GetEnvironmentVariable("Path", "User")
 }
 
 # The static half of the CLM contract. A dry run exercises only the preview
-# paths, so the code that actually applies settings (prefs writes, the
-# file-association tamper-hash, the P/Invoke broadcasts) can only be checked by
+# paths, so the code that actually applies settings (prefs writes, the P/Invoke
+# broadcasts) can only be checked by
 # reading it - a test must not run it on a real machine. This walks the call
 # graph to find what could execute while $CLM is true, then checks that none of
 # it touches .NET the engine would refuse.

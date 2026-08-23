@@ -42,7 +42,7 @@ function Get-ProgramFiles64 {
 # missing value - and because it fails mid-assignment the variable is left UNDEFINED,
 # so the next read of it throws a second time. Two red errors per lookup, on exactly
 # the fresh profile this script exists to set up: no Keyboard Layout\Toggle yet, and
-# no UserChoice for a file type nothing has claimed. Select-Object does the lookup
+# no shellbag for a folder nobody has opened. Select-Object does the lookup
 # inside the cmdlet, where a missing property is an ordinary error it can swallow.
 function Get-RegValue($path, $name) {
     Get-ItemProperty -LiteralPath $path -Name $name -ErrorAction SilentlyContinue |
@@ -399,44 +399,6 @@ function Set-PremierePro {
         Write-Host "      the node - diff a real prefs file around that control and update this"
         Write-Host "      script."
     }
-}
-
-# Set-FileAssociation <ext> <progid> - write a UserChoice entry so Explorer
-# treats <progid> as the default handler for <ext>. Windows protects this key
-# with a tamper hash tied to the user SID + current time; we compute it with MD5
-# and unlock the key's ACL so the write succeeds.
-function Set-FileAssociation {
-    param($Extension, $ProgId)
-    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $sub = "software\microsoft\windows\currentversion\explorer\fileexts\$Extension\userchoice"
-    $ft = [long][math]::Floor([datetime]::UtcNow.ToFileTime() / 10000000) * 10000000
-    $data = [System.Text.Encoding]::Unicode.GetBytes(
-        $sub + $sid.ToLower() + $ProgId.ToLower() + $ft.ToString('x') +
-        "user choice set via windows user experience {d18b6dd5-6124-4341-9318-804003bafa0b}")
-    $hash = [Convert]::ToBase64String([Security.Cryptography.MD5]::Create().ComputeHash($data))
-
-    $parent = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey(
-        "SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$Extension", $true)
-    try {
-        # UserChoice has a restrictive DACL - unlock it so we can delete the key
-        $uc = $parent.OpenSubKey("UserChoice",
-            [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
-            [System.Security.AccessControl.RegistryRights]::ChangePermissions)
-        if ($uc) {
-            $acl = $uc.GetAccessControl()
-            $acl.SetAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
-                        [System.Security.Principal.WindowsIdentity]::GetCurrent().Name, 'FullControl', 'Allow')))
-            $uc.SetAccessControl($acl)
-            $uc.Close()
-        }
-        $parent.DeleteSubKey("UserChoice", $false)
-    }
-    catch {}
-    $uc = $parent.CreateSubKey("UserChoice")
-    $uc.SetValue("ProgId", $ProgId)
-    $uc.SetValue("Hash", $hash)
-    $uc.Close()
-    $parent.Close()
 }
 
 # -----------------------------------------------------------------------------
@@ -849,12 +811,9 @@ $USER_SCOPE_PKGS = @(
     "AutoHotkey.AutoHotkey"
 )
 
-# Packages whose ONLY non-admin winget option is a portable zip - a worse
-# install than $USER_SCOPE_PKGS (no Start Menu shortcut/uninstall entry, and
-# for VLC specifically, Set-DefaultApp can't register a portable build as a
-# default). So these stay queued in the elevated machine-wide batch on every
-# run, and only fall back to a per-user portable install when elevation isn't
-# available (see Invoke-SlowPass).
+# Packages whose ONLY non-admin winget option is a portable zip. So these stay
+# queued in the elevated machine-wide batch on every run, and only fall back to
+# a per-user portable install when elevation isn't available.
 $PORTABLE_FALLBACK_PKGS = @("VideoLAN.VLC", "Audacity.Audacity")
 
 # The real (Program Files) install path for each $PORTABLE_FALLBACK_PKGS
@@ -862,7 +821,6 @@ $PORTABLE_FALLBACK_PKGS = @("VideoLAN.VLC", "Audacity.Audacity")
 # portable". winget's own DB (Test-WingetInstalled) can't tell scopes apart,
 # so without this a portable fallback would read as "done" forever and the
 # machine-wide install would never be retried once admin becomes available.
-# Shared with $DEFAULT_APPS below so VLC's path isn't duplicated.
 $MACHINE_EXE_PATH = @{
     "VideoLAN.VLC"      = "$(Get-ProgramFiles64)\VideoLAN\VLC\vlc.exe"
     "Audacity.Audacity" = "$(Get-ProgramFiles64)\Audacity\Audacity.exe"
@@ -885,28 +843,6 @@ $PKG_ALIAS = @{
     "lucuma13.prem-down"          = "prem-down"
 }
 function Get-PkgAlias($id) { if ($PKG_ALIAS.ContainsKey($id)) { $PKG_ALIAS[$id] } else { $id } }
-
-# Default-app targets - the apps we make the OS default for and the file types
-# each should own. WingetId ties each to its package so the friendly name comes
-# from $PKG_ALIAS (shared with the "install or update" checklist line). ProgId
-# contains "{ext}" for installers that register a per-extension ProgId (VLC ->
-# VLC.mp4, VLC.mkv, ...); otherwise it's a single ProgId used for every type
-# (the 64-bit Acrobat Reader). This one list drives the checklist and
-# Set-DefaultApp.
-$DEFAULT_APPS = @(
-    @{
-        WingetId = "VideoLAN.VLC"
-        Exe      = $MACHINE_EXE_PATH["VideoLAN.VLC"]
-        ProgId   = "VLC.{ext}"
-        Exts     = @('mp4', 'm4v', 'mov', 'mkv', 'avi', 'wmv', 'flv', 'webm', 'mpg', 'mpeg', 'm2ts', 'mts', 'ts', 'vob', 'mxf')
-    }
-    @{
-        WingetId = "Adobe.Acrobat.Reader.64-bit"
-        Exe      = "$(Get-ProgramFiles64)\Adobe\Acrobat DC\Acrobat\Acrobat.exe"
-        ProgId   = "Acrobat.Document.DC"
-        Exts     = @('pdf')
-    }
-)
 
 # Remove-SelfTemp - delete our own copy when we were launched from a temp file.
 # The documented entrypoint downloads the script to %TEMP% before running it;
@@ -1236,18 +1172,6 @@ function Show-Checklist {
     elseif ($FAST) { Skipped "Enable Windows long path support - requires --full (needs admin elevation)" }
     else { WouldRun "Enable Windows long path support" }
 
-    # Default apps - one line covering every $DEFAULT_APPS target. "Done" once
-    # every installed app owns its types; nothing to do if none of them are
-    # installed.
-    $names = ($DEFAULT_APPS | ForEach-Object { Get-PkgAlias $_.WingetId }) -join ", "
-    $installedApps = @($DEFAULT_APPS | Where-Object { Test-Path $_.Exe })
-    $anyInstalled = $installedApps.Count -gt 0
-    $allDefault = -not ($installedApps | Where-Object { -not (Test-DefaultOwned $_) })
-    if ($CLM) { Skipped  "Make default: $names - Not allowed under Constrained Language Mode" }
-    elseif (-not $anyInstalled -and $FAST) { Skipped  "Make default: $names - one or more not installed" }
-    elseif ($anyInstalled -and $allDefault) { Done     "Make default: $names" }
-    else { WouldRun "Make default: $names" }
-
     # Install or update apps - winget packages, non-winget programs (Premiere Pro plugins) and uv tools
     # (each entry paired with its "already installed?" check). Installation is slow, so it runs last.
     $apps = @()
@@ -1281,41 +1205,9 @@ function Show-Checklist {
 # Phase functions
 # -----------------------------------------------------------------------------
 # Invoke-FastPass - lightweight preference changes only (no downloads/installs).
-# Invoke-SlowPass - everything that downloads or installs. Setting default apps
-# is config that needs the app present, so Set-DefaultApp runs in both phases
-# (idempotent: it re-checks the current default and no-ops once the app already
-# owns its types). The bare command runs Invoke-FastPass inline then hands off
-# to a Full pass that runs Invoke-SlowPass; --fast runs Invoke-FastPass only and
-# --full runs both.
-
-# Resolve the ProgId $app should own for $ext (fills in "{ext}" when present).
-function Get-DefaultProgId($app, $ext) { $app.ProgId -replace '\{ext\}', $ext }
-
-# True when $app is already the OS default for its file types (probe the first ext).
-# Via Get-RegValue because on a fresh machine nothing has claimed the type yet, so
-# the UserChoice key does not exist at all.
-function Test-DefaultOwned($app) {
-    $ext = $app.Exts[0]
-    $cur = Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.$ext\UserChoice" 'ProgId'
-    $cur -eq (Get-DefaultProgId $app $ext)
-}
-
-function Set-DefaultApp {
-    # Point Explorer's per-extension UserChoice at each $DEFAULT_APPS target's
-    # ProgIds. Each app is gated on being installed and re-checks the current
-    # default, so it's a no-op once owned and safe to call from both phases. The
-    # UserChoice tamper-hash needs MD5 + a registry-ACL edit, neither of which
-    # is available under CLM - skip the whole step there (the checklist reports
-    # it).
-    if ($CLM) { return }
-    foreach ($app in $DEFAULT_APPS) {
-        if (-not (Test-Path $app.Exe)) { continue }
-        if (Test-DefaultOwned $app) { continue }
-        foreach ($ext in $app.Exts) {
-            try { Set-FileAssociation ".$ext" (Get-DefaultProgId $app $ext) } catch {}
-        }
-    }
-}
+# Invoke-SlowPass - everything that downloads or installs. The bare command runs
+# Invoke-FastPass inline then hands off to a Full pass that runs Invoke-SlowPass;
+# --fast runs Invoke-FastPass only and --full runs both.
 
 function Install-AhkScript {
     # Download the AHK macro script into the work dir and launch it now so the
@@ -1480,9 +1372,6 @@ public class Win32Shell {
         }
         [Win32Shell]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)  # SHCNE_ASSOCCHANGED
     }
-
-    # Default apps - config that needs the app present (see Set-DefaultApp)
-    Set-DefaultApp
 
     # Taskbar and tray.
     $taskbarChanged = Set-Taskbar
@@ -1784,9 +1673,6 @@ public class Win32Env {
     # the fast pass) looked. Runs here in the non-elevated process so the cfg
     # lands in the real user's %APPDATA%, not the admin's. Idempotent.
     Set-AudacityConfig
-
-    # Default apps - now that VLC/Acrobat are installed (covers a fresh machine)
-    Set-DefaultApp
 
     # AHK macros - AutoHotkey was installed above on a Full run (or already
     # present). Launched non-elevated from this process so the macros work on
