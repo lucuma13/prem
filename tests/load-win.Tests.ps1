@@ -1298,14 +1298,10 @@ Describe "fast mode requests no elevation (no UAC)" {
     }
 }
 
-# The work dir (Downloads\load-win) exists only to hold what Invoke-SlowPass
-# downloads into it (LUTs, the Mister Horse/Flicker Free installers, the AHK
-# script) - Invoke-FastPass never writes there. Creating it unconditionally in
-# the top-level dispatch block, ahead of Invoke-FastPass, meant a --fast-only
-# run - or a bare run where the user declined the Full prompt - left an empty
-# load-win folder behind in Downloads forever, since nothing ever deletes it.
-# AST-based (not text) so a reformat can't dodge the check.
-Describe "the work dir is only created by the pass that uses it" {
+# The work dir holds what load downloads (LUTs, the Mister Horse/Flicker Free
+# installers, the AHK script). Each creation sits in the function that is about
+# to write into it: the folder appears when it has contents and not before.
+Describe "the work dir is created only where it is written into" {
     BeforeAll {
         $srcPath = (Resolve-Path "$PSScriptRoot/../src/load-win.ps1").Path
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($srcPath, [ref]$null, [ref]$null)
@@ -1327,18 +1323,99 @@ Describe "the work dir is only created by the pass that uses it" {
                     $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and
                     $_.VariablePath.UserPath -eq 'WorkDir' })
             }, $true)
+        $script:workDirCreateFuncs = @($workDirCreates | ForEach-Object { Get-EnclosingFunc $_ })
     }
 
-    It "creates `$WorkDir exactly once" {
-        @($workDirCreates).Count | Should -Be 1 -Because "one creation point keeps this easy to reason about"
-    }
-
-    It "creates it inside Invoke-SlowPass, not the top-level dispatch block" {
-        $enclosing = Get-EnclosingFunc $workDirCreates[0]
-        $enclosing | Should -Be 'Invoke-SlowPass' -Because (
-            "only the Full pass writes into it (LUTs, Mister Horse, Flicker Free, the AHK script) - " +
-            "creating it earlier (e.g. before Invoke-FastPass runs) leaves an empty load-win folder " +
+    It "creates `$WorkDir only inside a function, never in the top-level dispatch block" {
+        @($workDirCreateFuncs) | Should -Not -Contain $null -Because (
+            "a create in the dispatch block runs on every mode, leaving an empty load-win folder " +
             "behind in Downloads on any --fast-only or fast-then-decline run")
+    }
+
+    It "creates it only in functions that download into it" {
+        $allowed = 'Invoke-SlowPass', 'Install-AhkScript'
+        foreach ($f in $workDirCreateFuncs) {
+            $f | Should -BeIn $allowed -Because "$f does not write into the work dir, so it must not create it"
+        }
+    }
+
+    It "Install-AhkScript creates it before curl writes the macro script into it" {
+        $fn = $ast.Find({ param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Install-AhkScript' }, $true)
+        $create = $workDirCreates | Where-Object { $_.Extent.StartOffset -gt $fn.Extent.StartOffset -and $_.Extent.EndOffset -lt $fn.Extent.EndOffset }
+        $curl = $fn.Find({ param($n)
+                $n -is [System.Management.Automation.Language.CommandAst] -and
+                $n.GetCommandName() -eq 'curl.exe' }, $true)
+
+        @($create).Count | Should -Be 1 -Because (
+            "Invoke-FastPass reaches Install-AhkScript before Invoke-SlowPass has created the work dir")
+        $create.Extent.StartOffset | Should -BeLessThan $curl.Extent.StartOffset -Because (
+            "curl writes nothing and exits 23 into a missing directory, and -s hides the error")
+    }
+}
+
+# "Activated" means an interpreter is running the macro script: it is launched
+# once per run and nothing restarts it at sign-in, so the file outlives every
+# reboot while the hotkeys do not.
+Describe "Install-AhkScript activates the macros, not just downloads them" {
+    BeforeAll {
+        $script:box = Join-Path ([IO.Path]::GetTempPath()) "ahk-activate-$(New-Guid)"
+        New-Item -ItemType Directory -Force -Path $box | Out-Null
+    }
+    AfterAll { Remove-Item $box -Recurse -Force -ErrorAction SilentlyContinue }
+
+    BeforeEach {
+        $script:WorkDir = Join-Path $box 'load-win'
+        $script:AhkScript = Join-Path $WorkDir 'MacKeyboard_LGG.ahk'
+        $script:MSE = $false
+        Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
+        Mock Find-AhkExe { 'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe' }
+        Mock Start-Process { }
+    }
+
+    It "launches the interpreter when the script is already downloaded but nothing is running" {
+        New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+        Set-Content -LiteralPath $AhkScript -Value '; macros' -Encoding Ascii
+        Mock Test-AhkRunning { $false }
+
+        Install-AhkScript
+
+        Should -Invoke Start-Process -Times 1 -Exactly -Because (
+            "a downloaded script nothing is running is exactly the state every reboot leaves behind")
+    }
+
+    It "leaves a running interpreter alone" {
+        New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+        Set-Content -LiteralPath $AhkScript -Value '; macros' -Encoding Ascii
+        Mock Test-AhkRunning { $true }
+
+        Install-AhkScript
+
+        Should -Invoke Start-Process -Times 0 -Exactly
+    }
+
+    It "does nothing under --mse" {
+        Mock Test-AhkRunning { $false }
+        $script:MSE = $true
+
+        Install-AhkScript
+
+        Should -Invoke Start-Process -Times 0 -Exactly
+        Test-Path $WorkDir | Should -BeFalse -Because "--mse leaves no work dir behind"
+    }
+
+    It "launches nothing, and leaves no partial file, when the download fails" -Skip:(-not $IsWindowsHost) {
+        Mock Test-AhkRunning { $false }
+        Mock Find-AhkExe { 'C:\Windows\System32\cmd.exe' }
+        # A host that resolves to nothing: curl exits non-zero and writes no file.
+        $script:AhkScript = Join-Path $WorkDir 'MacKeyboard_LGG.ahk'
+        Mock curl.exe { $global:LASTEXITCODE = 6 }
+
+        Install-AhkScript
+
+        Should -Invoke Start-Process -Times 0 -Exactly
+        Test-Path $AhkScript | Should -BeFalse
     }
 }
 

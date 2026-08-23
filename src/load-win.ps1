@@ -86,8 +86,8 @@ $PremiereDir = Join-Path $DocumentsDir "Adobe\Premiere Pro"
 # library by the tests, and --dry-run is a preview that must not touch the disk.
 $WorkDir = Join-Path $DownloadsDir "load-win"
 
-# AHK macros live in the work dir - the user double-clicks the script after
-# rebooting to activate it.
+# AHK macros live in the work dir. Nothing relaunches them at sign-in, so after
+# a reboot the user double-clicks the script to activate the macros.
 $AhkScript = Join-Path $WorkDir "MacKeyboard_LGG.ahk"
 
 # Find-AhkExe - locate an installed AutoHotkey interpreter, or return $null.
@@ -119,6 +119,46 @@ function Find-AhkExe {
             Select-Object -First 1 -ExpandProperty FullName
     }
     return $exe
+}
+
+# Test-AhkRunning - is an interpreter currently running our macro script?
+function Test-AhkRunning {
+    $leaf = Split-Path $AhkScript -Leaf
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'AutoHotkey%'" -ErrorAction SilentlyContinue)
+    foreach ($p in $procs) {
+        if ($p.CommandLine -and $p.CommandLine -like "*$leaf*") { return $true }
+    }
+    return $false
+}
+
+function Install-AhkScript {
+    # Download the AHK macro script into the work dir and launch it now so the
+    # shortcuts work immediately.
+    #
+    # A running interpreter is the "done" marker, not the downloaded file
+    if ($MSE) { return }
+    if (Test-AhkRunning) { return }
+    $ahkExe = Find-AhkExe
+    if (-not $ahkExe) {
+        Write-Host "  [warn] AutoHotkey not found - skipping AHK shortcuts"
+        return
+    }
+    # Invoke-FastPass reaches this too, and only Invoke-SlowPass creates the
+    # work dir. curl writes nothing and exits 23 when the parent directory is
+    # missing, and -s hides that error, so a fast pass launched AutoHotkey
+    # against a file it had never downloaded.
+    New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+    if (-not (Test-Path $AhkScript)) {
+        curl.exe -s -o $AhkScript "https://raw.githubusercontent.com/lucuma13/load/refs/heads/main/src/data/MacKeyboard_LGG.ahk"
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $AhkScript)) {
+            # A partial file would be launched as a broken script, so it goes.
+            Remove-Item $AhkScript -Force -ErrorAction SilentlyContinue
+            Write-Host "  [warn] Could not download the AHK macros - skipping AHK shortcuts"
+            return
+        }
+    }
+    # Quote the path and launch non-elevated - so macros will work only on non-elevated apps.
+    Start-Process $ahkExe -ArgumentList "`"$AhkScript`""
 }
 
 # Find-UvExe - locate the uv executable, or return $null. We invoke uv by full
@@ -1138,7 +1178,7 @@ function Show-Checklist {
     $sysOk = $kbOk -and $togglesOk -and (Test-ExplorerViewFullyApplied) -and (Test-Taskbar) -and (Test-TrayIcon)
     $longPathsOk = (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled") -eq 1
     $premiereRunning = $PREMIERE_OK -and ($null -ne (Get-Process -Name "Adobe Premiere Pro*" -ErrorAction SilentlyContinue))
-    $ahkActive = Test-Path $AhkScript
+    $ahkActive = Test-AhkRunning
     $ahkInstalled = [bool](Find-AhkExe)
 
     Write-Host ""
@@ -1165,7 +1205,8 @@ function Show-Checklist {
 
     # Activate AHK macros - applied whenever AutoHotkey is present. In --fast we
     # might only have a pre-installed AutoHotkey to work with (installing it is
-    # a Full-pass step).
+    # a Full-pass step). "Done" means an interpreter is running the script right
+    # now; a downloaded script that nothing is running is still to-do.
     if ($MSE) { Skipped  "Activate AHK macros - --mse" }
     elseif ($ahkActive) { Done     "Activate AHK macros" }
     elseif ($ahkInstalled) { WouldRun "Activate AHK macros" }
@@ -1217,26 +1258,6 @@ function Show-Checklist {
 # Invoke-SlowPass - everything that downloads or installs. The bare command runs
 # Invoke-FastPass inline then hands off to a Full pass that runs Invoke-SlowPass;
 # --fast runs Invoke-FastPass only and --full runs both.
-
-function Install-AhkScript {
-    # Download the AHK macro script into the work dir and launch it now so the
-    # shortcuts work immediately. The file's presence there is the "done"
-    # marker.
-    #
-    # --mse stops here too: the package is already out of the install lists,
-    # but the macros would otherwise still be dropped and launched on a machine
-    # that has its own AutoHotkey.
-    if ($MSE) { return }
-    if (Test-Path $AhkScript) { return }
-    $ahkExe = Find-AhkExe
-    if (-not $ahkExe) {
-        Write-Host "  [warn] AutoHotkey not found - skipping AHK shortcuts"
-        return
-    }
-    curl.exe -s -o $AhkScript "https://raw.githubusercontent.com/lucuma13/load/refs/heads/main/src/data/MacKeyboard_LGG.ahk"
-    # Quote the path and launch non-elevated - so macros will work only on non-elevated apps.
-    Start-Process $ahkExe -ArgumentList "`"$AhkScript`""
-}
 
 function Invoke-FastPass {
     # Audacity - spectrogram track view and its frequency range. Catches an
@@ -1605,8 +1626,9 @@ function Invoke-ElevatedInstall {
 }
 
 function Invoke-SlowPass {
-    # Created here: this is the only pass that ever writes into it, so a
-    # --fast-only or fast-then-decline run never creates it.
+    # Every pass creates the work dir on the paths that write into it and
+    # nowhere else, so a --fast-only or fast-then-decline run that installs
+    # nothing leaves no empty load-win folder behind in Downloads.
     New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 
     # All installs that need admin rights (machine-wide winget packages + the
@@ -1702,8 +1724,9 @@ try {
     if ($DRY_RUN) { Show-Checklist; exit 0 }
 
     # Fast pass runs for every mode (--fast, --full, and the bare command). It
-    # never touches $WorkDir - see Invoke-SlowPass for why creating it is
-    # deferred to there.
+    # creates $WorkDir only on the paths that write into it (the LUTs, the AHK
+    # macros) - see Invoke-SlowPass for why there is no unconditional create
+    # ahead of this call.
     Invoke-FastPass
 
     # The bare command pauses between the quick config and the heavy installs.
