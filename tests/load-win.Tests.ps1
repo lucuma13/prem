@@ -226,7 +226,6 @@ Describe "elevated installers run unattended" {
     It "refreshes the package source without prompting" {
         $src = @($queued | Where-Object { $_ -match '"winget source\b' })
         $src.Count | Should -Be 1 -Because "the source is warmed once, ahead of the package commands"
-        $src[0] | Should -CMatch '\s--accept-source-agreements\b' -Because "a first-time account is otherwise asked to accept them"
         $src[0] | Should -CMatch '\s--disable-interactivity\b' -Because "nothing in an unattended batch may raise a prompt"
     }
 

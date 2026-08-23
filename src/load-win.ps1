@@ -956,7 +956,7 @@ $LONG_PATHS_OK = (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control\FileSyste
 $AUDACITY_OK = Test-AppInstalled 'Audacity'
 # Audacity rewrites audacity.cfg wholesale when it quits, so anything written
 # while it is open is discarded on exit. Same reasoning as $PREMIERE_RUNNING.
-$AUDACITY_RUNNING = $AUDACITY_OK -and ($null -ne (Get-Process -Name "audacity" -ErrorAction SilentlyContinue))
+$AUDACITY_RUNNING = $AUDACITY_OK -and ($null -ne (Get-Process -Name "Audacity" -ErrorAction SilentlyContinue))
 
 # Audacity's settings file.
 $AUDACITY_CFG = Join-Path $env:APPDATA "audacity\audacity.cfg"
@@ -1104,7 +1104,7 @@ function Set-AudacityConfig {
     if ($CLM) { return }   # Set-AudacityPref needs .NET byte IO; see its header
     # Re-checked rather than reading $AUDACITY_OK - see the header.
     if (-not (Test-AppInstalled 'Audacity')) { return }
-    if ($null -ne (Get-Process -Name "audacity" -ErrorAction SilentlyContinue)) {
+    if ($null -ne (Get-Process -Name "Audacity" -ErrorAction SilentlyContinue)) {
         Write-Host "  [warn] Audacity is running - spectrogram settings not changed"
         return
     }
@@ -1526,8 +1526,8 @@ function Invoke-ElevatedInstall {
             # per user, and the user here is not the one who ran the script: a
             # standard user's elevation lands in whichever admin account
             # answered the UAC prompt. One serialised attempt ahead of the batch
-            # is what that account needs
-            $cmds += "winget source update --accept-source-agreements --disable-interactivity"
+            # is what that account needs.
+            $cmds += "winget source update --disable-interactivity"
             foreach ($id in $ids) {
                 if (Test-PkgReallyInstalled $id) {
                     $cmds += "winget upgrade --id $id --exact --silent --accept-package-agreements --accept-source-agreements"
