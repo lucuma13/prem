@@ -354,6 +354,44 @@ Describe "Mister Horse sign-out" {
         $dispatch | Should -Not -BeNullOrEmpty -Because "the dispatch block should be findable"
         $dispatch | Should -BeLike "*Clear-MisterHorse*"
     }
+
+    # Removing the app's files signs the account out of the app and nothing more:
+    # one click of "Log in with browser" re-authorises from the browser session.
+    It "removes the browser session that would sign the account back in" {
+        $body = [regex]::Match($unloadWin, '(?s)function Clear-MisterHorse \{.*?\n\}').Value
+        $body | Should -BeLike "*Get-MisterHorseBrowserPath*"
+        $body.IndexOf('Get-MisterHorseStatePath') | Should -BeGreaterOrEqual 0 -Because (
+            "the app's own state still goes too")
+    }
+
+    It "clears only the profiles that carry the origin" {
+        $body = [regex]::Match($unloadWin, '(?s)function Get-MisterHorseBrowserPath \{.*?\n\}').Value
+        $body | Should -BeLike "*`$MH_ORIGIN*" -Because "the profile has to be matched, not assumed"
+        $body | Should -BeLike "*Profile *" -Because "the signed-in profile is routinely not Default"
+        $body | Should -BeLike "*Default*"
+    }
+
+    It "yields only browser paths the delete guard will accept" {
+        foreach ($path in Get-MisterHorseBrowserPath) {
+            Test-UnderHome $path | Should -BeTrue -Because "'$path' would be refused by Remove-TargetPath"
+        }
+    }
+
+    It "yields no browser path when LOCALAPPDATA is unset" {
+        $saved = $env:LOCALAPPDATA
+        try {
+            $env:LOCALAPPDATA = ""
+            @(Get-MisterHorseBrowserPath).Count | Should -Be 0
+        }
+        finally { $env:LOCALAPPDATA = $saved }
+    }
+
+    # Chrome writes these stores back from memory as it closes, so the browser
+    # has to be gone before this phase runs.
+    It "runs after Chrome has been quit" {
+        $dispatch = [regex]::Match($unloadWin, '(?s)^try \{.*?\n\}', 'Multiline').Value
+        $dispatch.IndexOf('Clear-Chrome') | Should -BeLessThan $dispatch.IndexOf('Clear-MisterHorse')
+    }
 }
 
 # Quit Google Chrome the polite way, since a forced Chrome reopens with the
@@ -378,6 +416,14 @@ Describe "Mister Horse is signed out" {
 
     It "uninstalls nothing" {
         $mhBody | Should -Not -BeLike "*Uninstall-WingetPackage*"
+    }
+
+    It "does not count quitting the app as a sign-out" {
+        $mhBody | Should -BeLike "*Stop-MisterHorseProcess*" -Because (
+            "the quit still has to happen, or the delete does not stick")
+        $mhBody | Should -Not -Match 'if \(Stop-MisterHorseProcess\)[^\r\n]*\$did'
+        @([regex]::Matches($mhBody, '\$did = \$true')).Count | Should -Be 1 -Because (
+            "removing the state is the sign-out, so only that may report work done")
     }
 
     # The DisplayName the Product Manager registers in the uninstall key, read off
@@ -461,12 +507,13 @@ Describe "Google Chrome" {
     }
 
     # A quit and nothing more: Chrome stays installed and the profile - bookmarks,
-    # history, whoever is signed into it - is left exactly as it is.
+    # history, whoever is signed into it - is left exactly as it is. The browser
+    # session Mister Horse re-authorises through is that phase's business, not
+    # this one's, and it names the one profile it touches.
     It "removes nothing and uninstalls nothing" {
         $script:clearBody | Should -Not -BeNullOrEmpty -Because "Clear-Chrome should be findable"
         $script:clearBody | Should -Not -BeLike "*Remove-TargetPath*"
         $script:clearBody | Should -Not -BeLike "*Uninstall-WingetPackage*"
-        $script:unloadWin | Should -Not -BeLike "*User Data*" -Because "the Chrome profile is not unload's to touch"
     }
 
     It "runs as its own phase in the dispatch block" {
@@ -668,6 +715,11 @@ Describe "Shell history cleanup order" {
 
     It "claims a clean console only when both buffers were dealt with" {
         $historyBody | Should -BeLike '*$stopped -and $cleared*'
+    }
+
+    It "reports work done in the caller's own console, file or no file" {
+        $historyBody | Should -Match '\$did = \$inCallerSession'
+        $historyBody | Should -Not -Match '\$did = \$false'
     }
 }
 

@@ -182,6 +182,10 @@ function Get-ClaudeNativeExePath {
     return "$HOME\.local\bin\claude.exe"
 }
 
+# The site whose stored browser login is the other half of the Mister Horse
+# sign-out.
+$MH_ORIGIN = 'misterhorse.com'
+
 # Get-MisterHorseStatePath - the per-user state Mister Horse keeps, which on
 # Windows is also where the signed-in account lives.
 #
@@ -195,6 +199,29 @@ function Get-ClaudeNativeExePath {
 function Get-MisterHorseStatePath {
     if (-not $env:LOCALAPPDATA) { return @() }
     return @("$env:LOCALAPPDATA\MisterHorse")
+}
+
+# Get-MisterHorseBrowserPath - the browser half of the Mister Horse sign-out.
+#
+# The Product Manager keeps no token of its own. It re-authorises through
+# misterhorse.com in the browser - OAuth + PKCE, the code handed back over the
+# misterhorsepm: protocol handler.
+function Get-MisterHorseBrowserPath {
+    if (-not $env:LOCALAPPDATA) { return @() }
+    $userData = "$($env:LOCALAPPDATA.TrimEnd('\'))\Google\Chrome\User Data"
+    if (-not (Test-Path -LiteralPath $userData)) { return @() }
+    $paths = @()
+    foreach ($dir in Get-ChildItem -LiteralPath $userData -Directory -ErrorAction SilentlyContinue) {
+        if ($dir.Name -ne 'Default' -and $dir.Name -notlike 'Profile *') { continue }
+        $stores = @("$($dir.FullName)\Local Storage", "$($dir.FullName)\Session Storage")
+        foreach ($store in $stores) {
+            if (-not (Test-Path -LiteralPath $store)) { continue }
+            $carries = Get-ChildItem -LiteralPath $store -Recurse -File -ErrorAction SilentlyContinue |
+                Select-String -Pattern $MH_ORIGIN -SimpleMatch -List -ErrorAction SilentlyContinue
+            if ($carries) { $paths += $stores; break }
+        }
+    }
+    return @($paths | Select-Object -Unique)
 }
 
 # Get-HistoryPath - every shell-history file to remove.
@@ -621,8 +648,8 @@ function Stop-MisterHorseProcess {
 # sign-out.
 function Clear-MisterHorse {
     $did = $false
-    if (Stop-MisterHorseProcess) { $did = $true }
-    foreach ($path in Get-MisterHorseStatePath) {
+    $null = Stop-MisterHorseProcess
+    foreach ($path in @(Get-MisterHorseStatePath) + @(Get-MisterHorseBrowserPath)) {
         if (Remove-TargetPath $path) { $did = $true }
     }
     $skipMsg = if (Test-MisterHorseInstalled) {
@@ -690,18 +717,21 @@ function Clear-ShellHistory {
     # this console while the script is running, so that window was never really
     # open - but this is also the order of the one-liner the summary hands the user
     # to run by hand, and the two should not disagree.
+
+    $inCallerSession = Test-InCallerSession
+
     if (-not $DRY_RUN) {
         # Both evaluated before the -and, deliberately: it short-circuits, and the
         # buffer still wants clearing even when saving could not be switched off.
-        $stopped = Stop-HistorySaving
+        $stopped = Stop-HistorySaving -InCallerSession $inCallerSession
         Clear-History -ErrorAction SilentlyContinue
-        $cleared = Clear-HistoryBuffer
+        $cleared = Clear-HistoryBuffer -InCallerSession $inCallerSession
         # Only "clean" when both took. Saving switched off while arrow-up still
         # hands back the entrypoint is not what that sign-off promises.
         $script:HISTORY_STOPPED = $stopped -and $cleared
     }
 
-    $did = $false
+    $did = $inCallerSession
     foreach ($path in Get-HistoryPath) {
         if (Remove-TargetPath $path) { $did = $true }
     }
