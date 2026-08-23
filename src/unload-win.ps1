@@ -304,13 +304,24 @@ function Test-UnderHome {
 # (the CLM entrypoint downloads the script to %TEMP% first). PowerShell loads
 # the whole script into memory before running it, so deleting the file mid-run
 # is safe. Only ever removes a copy under %TEMP%; a checkout is left untouched.
-#
-# Kept above the library guard, so the tests can reach it..
 function Remove-SelfTemp {
     param([string]$path = $PSCommandPath, [string]$temp = $env:TEMP)
     if ($temp -and $path -and $path.StartsWith($temp, [System.StringComparison]::OrdinalIgnoreCase)) {
         Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
     }
+}
+
+# Report -Did -DoneMsg -WouldMsg -SkipMsg [-Failed -FailMsg] - the one status
+# line each cleanup phase prints, chosen from whichever fits what actually
+# happened: something is knowingly still there, something was removed, something
+# would be removed (--dry-run), or there was nothing there to begin with.
+function Report {
+    param([bool]$Did, [string]$DoneMsg, [string]$WouldMsg, [string]$SkipMsg,
+        [bool]$Failed, [string]$FailMsg)
+    if ($Failed) { Write-Host ("  " + "[warn]".PadRight(12) + $FailMsg); return }
+    if (-not $Did) { Write-Host ("  " + "[skipped]".PadRight(12) + $SkipMsg); return }
+    if ($DRY_RUN) { Write-Host ("  " + "[would]".PadRight(12) + $WouldMsg) }
+    else { Write-Host ("  " + "[done]".PadRight(12) + $DoneMsg) }
 }
 
 # Sourced as a library (tests set $env:LOAD_LIB): stop here, run nothing below.
@@ -358,19 +369,6 @@ $script:HISTORY_STOPPED = $false
 
 function Note { param($msg); Write-Host ("  " + "[note]".PadRight(12) + $msg) }
 
-# Report -Did -DoneMsg -WouldMsg -SkipMsg - the one status line each cleanup
-# phase prints, chosen from whichever of the three fits what actually happened:
-# something was removed, something would be removed (--dry-run), or there was
-# nothing there to begin with. Centralised here so every phase reports in the
-# same one-line-per-phase shape rather than each printing its own header plus a
-# line per item removed.
-function Report {
-    param([bool]$Did, [string]$DoneMsg, [string]$WouldMsg, [string]$SkipMsg)
-    if (-not $Did) { Write-Host ("  " + "[skipped]".PadRight(12) + $SkipMsg); return }
-    if ($DRY_RUN) { Write-Host ("  " + "[would]".PadRight(12) + $WouldMsg) }
-    else { Write-Host ("  " + "[done]".PadRight(12) + $DoneMsg) }
-}
-
 # Get-DisplayPath <path> - shorten a path under $HOME to ~\... for display.
 # Presentation only; never feed the result back to a cmdlet.
 function Get-DisplayPath {
@@ -414,18 +412,16 @@ function Test-WingetPackage($id) {
 }
 
 # Uninstall-WingetPackage <id> <label> - uninstall a winget package, elevating
-# only if it turns out to be necessary. Returns $true when the package was there
-# to remove (so the caller can tell "cleaned" from "already clean"), $false when
-# it was never installed.
-#
+# only if it turns out to be necessary. Returns one of three outcomes, which the
+# caller feeds to Report.
 # The result is re-checked against winget because the elevated console swallows
 # its own exit code.
 function Uninstall-WingetPackage($id, $label) {
-    if (-not (Test-WingetPackage $id)) { return $false }
-    if ($DRY_RUN) { return $true }
+    if (-not (Test-WingetPackage $id)) { return 'absent' }
+    if ($DRY_RUN) { return 'removed' }
 
     winget uninstall --id $id --exact --silent --accept-source-agreements 2>&1 | Out-Null
-    if (-not (Test-WingetPackage $id)) { return $true }
+    if (-not (Test-WingetPackage $id)) { return 'removed' }
 
     try {
         Start-Process cmd.exe -Verb RunAs -Wait -ArgumentList (
@@ -434,9 +430,8 @@ function Uninstall-WingetPackage($id, $label) {
     catch {
         Write-Host "  [warn] Elevated uninstall did not run (admin prompt cancelled?): $_"
     }
-    if (-not (Test-WingetPackage $id)) { return $true }
-    Write-Host "  [warn] Could not uninstall $label - remove it from Settings > Apps by hand"
-    return $true
+    if (-not (Test-WingetPackage $id)) { return 'removed' }
+    return 'failed'
 }
 
 # -----------------------------------------------------------------------------
@@ -498,8 +493,13 @@ function Clear-PremiereWorkspace {
 function Clear-Ahk {
     $did = $false
     if (Stop-AhkProcess) { $did = $true }
-    if (Uninstall-WingetPackage $AHK_PKG "AutoHotkey") { $did = $true }
-    Report -Did $did -DoneMsg "Uninstalled AutoHotkey" -WouldMsg "Would uninstall AutoHotkey" -SkipMsg "AutoHotkey - Nothing to remove"
+    $uninstall = Uninstall-WingetPackage $AHK_PKG "AutoHotkey"
+    if ($uninstall -eq 'removed') { $did = $true }
+    Report -Did $did -Failed:($uninstall -eq 'failed') `
+        -DoneMsg "Uninstalled AutoHotkey" `
+        -WouldMsg "Would uninstall AutoHotkey" `
+        -SkipMsg "AutoHotkey - Nothing to remove" `
+        -FailMsg "AutoHotkey is still installed - remove it from Settings > Apps by hand"
 
     # Still on disk after the uninstall means it was installed some other way (the
     # .exe/.zip build from autohotkey.com rather than winget), which this script
@@ -620,7 +620,8 @@ function Clear-Claude {
 
     # Uninstall before wiping state, so a half-removed install can't confuse
     # winget's own uninstall.
-    if (Uninstall-WingetPackage $CLAUDE_PKG "Claude Code") { $did = $true }
+    $uninstall = Uninstall-WingetPackage $CLAUDE_PKG "Claude Code"
+    if ($uninstall -eq 'removed') { $did = $true }
 
     # The native installer's binary, removed by exact filename only - see
     # Get-ClaudeNativeExePath for why the containing folder is never touched.
@@ -630,7 +631,11 @@ function Clear-Claude {
         if (Remove-TargetPath $path) { $did = $true }
     }
 
-    Report -Did $did -DoneMsg "Uninstalled Claude" -WouldMsg "Would uninstall Claude" -SkipMsg "Claude Code - Nothing to remove"
+    Report -Did $did -Failed:($uninstall -eq 'failed') `
+        -DoneMsg "Uninstalled Claude" `
+        -WouldMsg "Would uninstall Claude" `
+        -SkipMsg "Claude Code - Nothing to remove" `
+        -FailMsg "Claude Code is still installed - remove it from Settings > Apps by hand"
 
     # A `claude` still on PATH after all that was installed some other way - a
     # global npm package, most likely - which this script deliberately doesn't

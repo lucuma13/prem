@@ -168,6 +168,59 @@ Describe "AutoHotkey target" {
 # pin the two ways that goes wrong: targeting the wrong file, and letting a
 # stranded copy report "nothing to do". $LoadTempCopy is defined below the
 # library guard, so assert against the source text.
+Describe "a winget uninstall that did not happen is not reported as done" {
+    BeforeAll {
+        $script:src = Get-Content "$PSScriptRoot/../src/unload-win.ps1" -Raw
+        $script:uninstallBody = [regex]::Match($src, '(?s)function Uninstall-WingetPackage.*?\n\}').Value
+    }
+
+    It "Uninstall-WingetPackage returns an outcome, never a bare boolean" {
+        $uninstallBody | Should -Not -BeNullOrEmpty -Because "Uninstall-WingetPackage should be findable"
+        $uninstallBody | Should -Not -Match 'return\s+\$(true|false)' -Because (
+            "'removed' and 'failed' both mean the package was installed, so a boolean cannot carry the outcome")
+        foreach ($outcome in "'absent'", "'removed'", "'failed'") {
+            $uninstallBody | Should -BeLike "*return $outcome*"
+        }
+    }
+
+    It "every caller distinguishes a removal from a failure" {
+        foreach ($fn in 'Clear-Ahk', 'Clear-Claude') {
+            $body = [regex]::Match($src, "(?s)function $fn \{.*?\n\}").Value
+            $body | Should -Not -BeNullOrEmpty -Because "$fn should be findable"
+            $body | Should -Match "-eq 'removed'" -Because "$fn must only count a real removal as done"
+            $body | Should -Match "-eq 'failed'" -Because "$fn must report a package still installed as such"
+        }
+    }
+
+    It "Report prints the failure line instead of the done line" {
+        $script:DRY_RUN = $false
+        $out = Report -Did $true -Failed $true -DoneMsg 'Uninstalled AutoHotkey' `
+            -WouldMsg 'Would uninstall AutoHotkey' -SkipMsg 'Nothing to remove' `
+            -FailMsg 'AutoHotkey is still installed - remove it by hand' 6>&1
+
+        "$out" | Should -Match '\[warn\]\s+AutoHotkey is still installed'
+        "$out" | Should -Not -Match '\[done\]'
+    }
+
+    It "Report still reports a clean removal as done" {
+        $script:DRY_RUN = $false
+        $out = Report -Did $true -Failed $false -DoneMsg 'Uninstalled AutoHotkey' `
+            -WouldMsg 'Would uninstall AutoHotkey' -SkipMsg 'Nothing to remove' `
+            -FailMsg 'still installed' 6>&1
+
+        "$out" | Should -Match '\[done\]\s+Uninstalled AutoHotkey'
+    }
+
+    It "Report treats an untouched phase as skipped, not failed" {
+        $script:DRY_RUN = $false
+        $out = Report -Did $false -Failed $false -DoneMsg 'Uninstalled AutoHotkey' `
+            -WouldMsg 'Would uninstall AutoHotkey' -SkipMsg 'AutoHotkey - Nothing to remove' `
+            -FailMsg 'still installed' 6>&1
+
+        "$out" | Should -Match '\[skipped\]\s+AutoHotkey - Nothing to remove'
+    }
+}
+
 Describe "Leftover load-win.ps1 in TEMP" {
     BeforeAll {
         $script:unloadWin = Get-Content "$PSScriptRoot/../src/unload-win.ps1" -Raw
