@@ -329,8 +329,6 @@ function Test-AppInstalled($pattern) {
     return $false
 }
 
-# The two Premiere plugins load installs.
-function Test-FlickerFreeInstalled { Test-AppInstalled 'Flicker Free' }
 function Test-MisterHorseInstalled { Test-AppInstalled 'Mister Horse' }
 
 # Report -Did -DoneMsg -WouldMsg -SkipMsg [-Failed -FailMsg] - the one status
@@ -628,7 +626,7 @@ function Clear-MisterHorse {
         if (Remove-TargetPath $path) { $did = $true }
     }
     $skipMsg = if (Test-MisterHorseInstalled) {
-        "Mister Horse Product Manager - already signed out (the app stays installed)"
+        "Mister Horse Product Manager - already signed out"
     }
     else { "Mister Horse Product Manager - Nothing to remove" }
 
@@ -711,16 +709,6 @@ function Clear-ShellHistory {
     Report -Did $did -DoneMsg "Cleared shell history" -WouldMsg "Would clear shell history" -SkipMsg "Shell history - Nothing to remove"
 }
 
-# Show-FlickerFree - report the plugin, remove nothing.
-function Show-FlickerFree {
-    $skipMsg = if (Test-FlickerFreeInstalled) {
-        "Flicker Free - still installed (plugins are left in place)"
-    }
-    else { "Flicker Free - Nothing to remove" }
-
-    Report -Did $false -DoneMsg "" -WouldMsg "" -SkipMsg $skipMsg
-}
-
 # -----------------------------------------------------------------------------
 # Dispatch
 # -----------------------------------------------------------------------------
@@ -741,7 +729,6 @@ try {
     Clear-WorkDir
     Clear-PremiereWorkspace
     Clear-MisterHorse
-    Show-FlickerFree
     Clear-Claude
     Clear-ShellHistory
 

@@ -357,55 +357,35 @@ Describe "Mister Horse sign-out" {
 }
 
 # Quit Google Chrome the polite way, since a forced Chrome reopens with the
-# "didn't shut down correctly" bar and a half-written profile.
-# unload leaves both Premiere plugins installed on purpose (see Show-Usage), so
-# the only thing it owes the reader is an honest line about each. "Nothing to
-# remove" against an installed Product Manager said the opposite, and Flicker
-# Free went unmentioned altogether.
-Describe "the Premiere plugins are reported, not removed" {
+# "didn't shut down correctly" bar and a half-written profile. unload signs the
+# account out of Mister Horse (but leaves the app installed).
+Describe "Mister Horse is signed out" {
     BeforeAll {
         $script:src = Get-Content "$PSScriptRoot/../src/unload-win.ps1" -Raw
         $script:mhBody = [regex]::Match($src, '(?s)function Clear-MisterHorse \{.*?\n\}').Value
-        $script:ffBody = [regex]::Match($src, '(?s)function Show-FlickerFree \{.*?\n\}').Value
     }
 
-    It "Mister Horse says 'already signed out' when the app is installed" {
+    It "says 'already signed out' when the app is installed" {
         $mhBody | Should -Not -BeNullOrEmpty -Because "Clear-MisterHorse should be findable"
         $mhBody | Should -BeLike "*Test-MisterHorseInstalled*" -Because (
             "the skip line has to know whether the app is there before claiming there is nothing to remove")
         $mhBody | Should -BeLike "*already signed out*"
     }
 
-    It "Flicker Free is reported by its own phase" {
-        $ffBody | Should -Not -BeNullOrEmpty -Because "Show-FlickerFree should be findable"
-        $ffBody | Should -BeLike "*Test-FlickerFreeInstalled*"
-        $ffBody | Should -BeLike "*still installed*"
+    It "says nothing to remove only when the app really is absent" {
+        $mhBody | Should -BeLike "*Mister Horse Product Manager - Nothing to remove*"
     }
 
-    It "runs Flicker Free as its own phase in the dispatch block" {
-        $dispatch = [regex]::Match($src, '(?s)^try \{.*?\n\}', 'Multiline').Value
-        $dispatch | Should -BeLike "*Show-FlickerFree*"
+    It "uninstalls nothing" {
+        $mhBody | Should -Not -BeLike "*Uninstall-WingetPackage*"
     }
 
-    It "neither plugin is uninstalled" {
-        foreach ($body in $mhBody, $ffBody) {
-            $body | Should -Not -BeLike "*Uninstall-WingetPackage*"
-        }
-        $ffBody | Should -Not -BeLike "*Remove-TargetPath*"
-    }
-
-    # The DisplayNames are what these two register in the uninstall key, read off
-    # Z4-01. A pattern that stops matching them makes both lines above lie.
-    It "matches the DisplayNames the plugins actually register" {
-        $names = @{
-            'Test-MisterHorseInstalled' = 'Mister Horse Product Manager'
-            'Test-FlickerFreeInstalled' = 'Flicker Free'
-        }
-        foreach ($fn in $names.Keys) {
-            $pattern = [regex]::Match($src, "function $fn \{ Test-AppInstalled '([^']+)'").Groups[1].Value
-            $pattern | Should -Not -BeNullOrEmpty -Because "$fn should call Test-AppInstalled with a pattern"
-            $names[$fn] | Should -Match $pattern
-        }
+    # The DisplayName the Product Manager registers in the uninstall key, read off
+    # Z4-01. A pattern that stops matching it makes the line above lie.
+    It "matches the DisplayName the app actually registers" {
+        $pattern = [regex]::Match($src, "function Test-MisterHorseInstalled \{ Test-AppInstalled '([^']+)'").Groups[1].Value
+        $pattern | Should -Not -BeNullOrEmpty -Because "Test-MisterHorseInstalled should call Test-AppInstalled with a pattern"
+        'Mister Horse Product Manager' | Should -Match $pattern
     }
 }
 
