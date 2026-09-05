@@ -990,6 +990,22 @@ $WINGET_OK = $null -ne (Get-Command winget -ErrorAction SilentlyContinue)
 # nested folder tree (e.g. mhl-suite).
 $LONG_PATHS_OK = (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled") -eq 1
 
+# Get-DiskIdleKey - the registry key holding "Turn off hard disk after" for the
+# active power scheme. Its AC/DC*SettingIndex values only exist once the setting
+# has been given an explicit value, so an absent key reads as "still on the
+# scheme default".
+function Get-DiskIdleKey {
+    $schemes = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes"
+    $active = Get-RegValue $schemes "ActivePowerScheme"
+    if (-not $active) { return $null }
+    "$schemes\$active\0012ee47-9041-4b5d-9b77-535fba8b1442\6738e2c4-e8a5-4a42-b16a-e040e769756e"
+}
+
+# "Turn off hard disk after" -> Never (0), on both AC and battery. Machine-wide,
+# needs elevation.
+$DISK_IDLE_KEY = Get-DiskIdleKey
+$DISK_SLEEP_OFF_OK = [bool]$DISK_IDLE_KEY -and ((Get-RegValue $DISK_IDLE_KEY "ACSettingIndex") -eq 0) -and ((Get-RegValue $DISK_IDLE_KEY "DCSettingIndex") -eq 0)
+
 # Audacity, by its Windows uninstall entry rather than an install path, so it is
 # found however it got onto the machine - our own winget Audacity.Audacity, a
 # manual download, or the Muse Hub build.
@@ -1177,6 +1193,10 @@ function Show-Checklist {
     $togglesOk = ((Get-RegValue $toggle 'Hotkey') -eq "3") -and ((Get-RegValue $toggle 'Language Hotkey') -eq "3") -and ((Get-RegValue $toggle 'Layout Hotkey') -eq "3")
     $sysOk = $kbOk -and $togglesOk -and (Test-ExplorerViewFullyApplied) -and (Test-Taskbar) -and (Test-TrayIcon)
     $longPathsOk = (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled") -eq 1
+    # Recomputed here (not the preflight $DISK_SLEEP_OFF_OK) so the end-of-run
+    # summary reflects the change the elevated batch just made.
+    $diskKey = Get-DiskIdleKey
+    $diskSleepOff = [bool]$diskKey -and ((Get-RegValue $diskKey "ACSettingIndex") -eq 0) -and ((Get-RegValue $diskKey "DCSettingIndex") -eq 0)
     $premiereRunning = $PREMIERE_OK -and ($null -ne (Get-Process -Name "Adobe Premiere Pro*" -ErrorAction SilentlyContinue))
     $ahkActive = Test-AhkRunning
     $ahkInstalled = [bool](Find-AhkExe)
@@ -1221,6 +1241,11 @@ function Show-Checklist {
     if ($longPathsOk) { Done "Enable Windows long path support" }
     elseif ($FAST) { Skipped "Enable Windows long path support - requires --full (needs admin elevation)" }
     else { WouldRun "Enable Windows long path support" }
+
+    # "Turn off hard disk after" -> Never - active power scheme, needs elevation.
+    if ($diskSleepOff) { Done "Keep drives spun up (never sleep)" }
+    elseif ($FAST) { Skipped "Keep drives spun up (never sleep) - requires --full (needs admin elevation)" }
+    else { WouldRun "Keep drives spun up (never sleep)" }
 
     # Install or update apps - winget packages, non-winget programs (Premiere Pro plugins) and uv tools
     # (each entry paired with its "already installed?" check). Installation is slow, so it runs last.
@@ -1483,6 +1508,14 @@ function Invoke-ElevatedInstall {
     # Long path support.
     if (-not $LONG_PATHS_OK) {
         $cmds += 'reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f'
+    }
+
+    # "Turn off hard disk after" -> Never, on the active power scheme (what the
+    # Settings/Control Panel toggle edits); disk-timeout-ac/-dc are powercfg's
+    # own aliases for it. Mirrors the macOS installer's pmset disksleep 0.
+    if (-not $DISK_SLEEP_OFF_OK) {
+        $cmds += 'powercfg /change disk-timeout-ac 0'
+        $cmds += 'powercfg /change disk-timeout-dc 0'
     }
 
     # Premiere plugins - download now (no admin needed), install in the elevated

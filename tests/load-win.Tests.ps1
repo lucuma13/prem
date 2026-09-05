@@ -238,8 +238,11 @@ Describe "elevated installers run unattended" {
     }
 
     # The catch-all: anything added to the batch later must carry a silent switch too.
+    # `winget source` and `powercfg /change` install nothing and open no window -
+    # they are config commands, like `reg add` (exempt via its own /f) - so they
+    # are held only to raising no prompt of their own.
     It "queues no installer that can stop for input" {
-        $installers = @($queued | Where-Object { $_ -notmatch '"winget source\b' })
+        $installers = @($queued | Where-Object { $_ -notmatch '"winget source\b' -and $_ -notmatch '\bpowercfg\b' })
         $loud = @($installers | Where-Object { $_ -notmatch '(?-i)\s(/S|/qn|/f|--silent)\b' })
         $loud | Should -BeNullOrEmpty -Because (
             "each of these can open a window an unattended run then waits on:`n$($loud -join "`n")")

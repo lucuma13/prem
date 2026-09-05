@@ -612,6 +612,12 @@ prefs_applied() {
     [ "$(defaults read com.apple.dock autohide 2>/dev/null)" = "1" ]
 }
 
+# Never put drives to sleep
+drives_stay_awake() {
+  [ "$(pmset -g custom 2>/dev/null |
+    awk '/disksleep/{n++; $2==0 && z++} END{print (n && n==z) ? "y" : "n"}')" = y ]
+}
+
 # Premiere plugins already on the machine (detected by install path). Mister
 # Horse's Product Manager lands in /Applications; Flicker Free drops its .plugin
 # under the shared Adobe MediaCore tree (nested in a "Digital Anarchy/Flicker
@@ -675,6 +681,15 @@ checklist() {
     already_done "System, Finder & TextEdit preferences"
   else
     would_run "System, Finder & TextEdit preferences"
+  fi
+
+  # Never put drives to sleep
+  if drives_stay_awake; then
+    already_done "Keep drives spun up (never sleep)"
+  elif $FAST; then
+    would_skip "Keep drives spun up (never sleep) (--fast)"
+  else
+    would_run "Keep drives spun up (never sleep)"
   fi
 
   # Pro Video Formats
@@ -905,6 +920,12 @@ run_slow() {
       osascript -e 'tell application "System Events" to set frontmost of (first process whose name is "Install Command Line Developer Tools") to true' &>/dev/null || true
       sleep 10
     done
+  fi
+
+  # Never put drives to sleep. A system-wide power setting, so it needs root and
+  # runs here.
+  if $DO_MACHINE; then
+    sudo pmset -a disksleep 0
   fi
 
   # Finder "Calculate all sizes" — a nested plist key defaults(1) can't reach,
